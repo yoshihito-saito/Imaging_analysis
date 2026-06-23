@@ -1,0 +1,20 @@
+name: histology
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - ipykernel
+  - ipywidgets
+  - jupyterlab
+  - matplotlib
+  - numpy
+  - pillow
+  - pytest
+  - scikit-image
+  - scipy
+  - tk
+  - tifffile
+  - xarray
+  - pip:
+      - nd2>=0.10

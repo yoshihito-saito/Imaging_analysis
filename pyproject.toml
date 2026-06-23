@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brain-section-pipeline"
+version = "0.1.0"
+description = "ND2 channel merging and rat brain section crop pipeline."
+requires-python = ">=3.10"
+dependencies = [
+    "nd2>=0.10",
+    "numpy",
+    "pillow",
+    "scikit-image",
+    "scipy",
+    "tifffile",
+    "xarray",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = ["--import-mode=importlib"]
+pythonpath = ["src"]
+testpaths = ["tests"]
