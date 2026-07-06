@@ -19,3 +19,13 @@
   registration, robust histology reconstruction, sparse 2D-to-3D atlas
   segmentation, and BrainGlobe/brainreg documentation.
 - Created per-source summaries, review, proposal, and answer.
+- Follow-up request: expanded BrainJ and BrainGlobe workflow details with a
+  focus on slide images, per-section handling, color channels, registration,
+  downstream analysis, and integration into this repository.
+- Checked BrainJ GitHub README and repository metadata. The BrainJ guide PDF was
+  located, but text could not be extracted through the available GitHub
+  connector, so BrainJ GUI details are marked as documentation/readme-level.
+- Checked BrainGlobe documentation for rat atlas availability, brainreg
+  workflow, orientation checking, output files, brainmapper channel/data
+  requirements, and brainglobe-segmentation.
+- Added workflow summaries and a Japanese BrainJ-vs-BrainGlobe review.

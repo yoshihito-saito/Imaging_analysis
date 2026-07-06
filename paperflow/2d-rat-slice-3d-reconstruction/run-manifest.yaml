@@ -1,7 +1,7 @@
 request_slug: 2d-rat-slice-3d-reconstruction
 created: 2026-07-06
 updated: 2026-07-06
-status: initial_review_complete
+status: brainj_brainglobe_workflow_review_complete
 source_repository: D:\Imaging_analysis
 library_sources:
   google_drive_paperpile:
@@ -10,7 +10,7 @@ library_sources:
 web_sources:
   status: searched
 depth: standard
-read_depth_note: Initial pass; summaries are mostly abstract/documentation-level, with local Drive spreadsheet inspected directly.
+read_depth_note: Initial pass plus BrainJ/BrainGlobe workflow expansion. BrainJ guide PDF was identified but not text-extracted; BrainJ summary is README/repository-level. BrainGlobe rat atlas and workflow notes are documentation-level.
 outputs:
   request: request.md
   run_log: run-log.md

@@ -10,3 +10,5 @@ This file will be updated from per-paper summaries.
 | Piluso et al. 2021, single coronal slice atlas segmentation | 2D section-to-atlas registration | Mouse | Abstract read | High for sparse datasets |
 | Tyson et al. 2022 / BrainGlobe brainreg docs | 3D volume-to-atlas registration | Mouse/BrainGlobe atlases | Documentation read | High downstream |
 | Local Brain Slice Registration spreadsheet | Tool comparison | Mixed | Local notes inspected | Very high practical shortlist |
+| BrainJ repository/README | Fiji serial section reconstruction and mouse atlas analysis | Mouse | Documentation read | High workflow reference; low direct rat atlas fit |
+| BrainGlobe Atlas API / brainreg / segmentation docs | Rat atlas registration and downstream atlas-aware segmentation | Rat and other species | Documentation read | Very high for production rat atlas backend |

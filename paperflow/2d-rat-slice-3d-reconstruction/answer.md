@@ -96,10 +96,25 @@ and desired GUI-vs-code workflow are confirmed.
 
 - `request.md`
 - `reviews/review.md`
+- `reviews/brainj-vs-brainglobe-workflows.md`
 - `proposals/2026-07-06-3d-reconstruction-pipeline.md`
 - `summaries/2018-ali-ultra-high-resolution-rat-pli.md`
 - `summaries/2017-agarwal-geometry-processing-mouse-slices.md`
 - `summaries/2021-casamitjana-robust-joint-registration.md`
 - `summaries/2021-piluso-automated-atlas-segmentation.md`
 - `summaries/2022-tyson-brainreg.md`
+- `summaries/brainj-workflow-summary.md`
+- `summaries/brainglobe-rat-workflow-summary.md`
 - `summaries/local-brain-slice-registration-spreadsheet.md`
+
+## BrainJ / BrainGlobe Follow-Up
+
+The detailed BrainJ-vs-BrainGlobe workflow review is now in
+`reviews/brainj-vs-brainglobe-workflows.md`.
+
+Short conclusion: use BrainJ as a workflow model for serial slide sections, but
+use BrainGlobe as the production atlas backend because BrainGlobe currently
+provides rat atlases such as `whs_sd_rat_39um`, `swc_female_rat_50um`, and
+`whs_sd_swc_female_rat_39um`. The repository should bridge the two worlds by
+exporting section crops, per-channel images, registration images, QC overlays,
+and a manifest before any atlas registration.
