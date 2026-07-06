@@ -1,0 +1,21 @@
+request_slug: 2d-rat-slice-3d-reconstruction
+created: 2026-07-06
+updated: 2026-07-06
+status: initial_review_complete
+source_repository: D:\Imaging_analysis
+library_sources:
+  google_drive_paperpile:
+    status: available
+    canonical_bib: https://drive.google.com/file/d/1-c4D6DeOqWkF-JXFrjRD9Nw5-S8IUJpV
+web_sources:
+  status: searched
+depth: standard
+read_depth_note: Initial pass; summaries are mostly abstract/documentation-level, with local Drive spreadsheet inspected directly.
+outputs:
+  request: request.md
+  run_log: run-log.md
+  literature_master: literature_master.md
+  add_candidates: literature_add_candidates.md
+  review: reviews/review.md
+  answer: answer.md
+  proposal: proposals/2026-07-06-3d-reconstruction-pipeline.md
