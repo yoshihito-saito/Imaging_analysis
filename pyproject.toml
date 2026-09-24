@@ -17,6 +17,19 @@ dependencies = [
     "xarray",
 ]
 
+[project.optional-dependencies]
+atlas = [
+    "brainglobe-atlasapi",
+]
+brainreg = [
+    "brainglobe-atlasapi",
+    "brainreg",
+]
+brainglobe = [
+    "brainglobe-atlasapi",
+    "brainreg",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
