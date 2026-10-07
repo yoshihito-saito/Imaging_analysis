@@ -15,7 +15,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pairing_manifest", type=Path, help="Path to the slice_atlas pairing manifest.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Directory for warped sections and registration overlays.")
-    parser.add_argument("--tissue-threshold-quantile", type=float, default=0.8, help="Quantile used to derive the section tissue mask.")
+    parser.add_argument("--tissue-threshold-quantile", type=float, default=0.8, help="Quantile used for the bright mask and stable source crop.")
+    parser.add_argument(
+        "--tissue-mask-mode",
+        choices=("envelope", "bright"),
+        default="envelope",
+        help="Mask used for fitting and Dice. bright preserves the previous high-threshold behavior.",
+    )
+    parser.add_argument(
+        "--save-mask-diagnostics",
+        action="store_true",
+        help="Compare bright and envelope masks at the selected transform in one CSV and contact sheet.",
+    )
     parser.add_argument("--max-rotation-degrees", type=float, default=0.0, help="Allowed rotation search range around the initial estimate.")
     parser.add_argument("--min-scale-factor", type=float, default=0.8, help="Lower scale bound relative to the initial estimate.")
     parser.add_argument("--max-scale-factor", type=float, default=1.0, help="Upper scale bound relative to the initial estimate.")
@@ -91,7 +102,7 @@ def main() -> None:
         "--boundary-fit-threshold-quantile",
         type=float,
         default=0.35,
-        help="Lower-threshold quantile used for outer-boundary scale containment during registration.",
+        help="Lower-threshold quantile used for the envelope mask and boundary containment.",
     )
     parser.add_argument(
         "--boundary-fit-dilation-px",
@@ -141,10 +152,19 @@ def main() -> None:
         default=3,
         help="Sample every N boundary pixels when estimating the local displacement field.",
     )
+    parser.add_argument("--save-individual-overlays", action="store_true", help="Save every per-section registration overlay.")
+    parser.add_argument(
+        "--low-quality-dice-threshold",
+        type=float,
+        default=0.80,
+        help="Save an individual overlay when a completed fit has Dice below this value.",
+    )
     args = parser.parse_args()
 
     config = SliceRegistrationConfig(
         tissue_threshold_quantile=args.tissue_threshold_quantile,
+        tissue_mask_mode=args.tissue_mask_mode,
+        save_mask_diagnostics=args.save_mask_diagnostics,
         max_rotation_degrees=args.max_rotation_degrees,
         min_scale_factor=args.min_scale_factor,
         max_scale_factor=args.max_scale_factor,
@@ -171,11 +191,17 @@ def main() -> None:
         nonlinear_control_point_spacing_px=args.nonlinear_control_point_spacing_px,
         nonlinear_iterations=args.nonlinear_iterations,
         nonlinear_boundary_sample_step=args.nonlinear_boundary_sample_step,
+        save_individual_overlays=args.save_individual_overlays,
+        low_quality_dice_threshold=args.low_quality_dice_threshold,
     )
     result = register_slices_to_atlas(args.pairing_manifest, args.output_dir, config=config)
     print(f"Slice registration output directory: {result.output_dir}")
     print(f"Registration manifest: {result.manifest_path}")
     print(f"Registration metadata: {result.metadata_path}")
+    print(f"Registration contact sheet: {result.contact_sheet_path}")
+    if result.mask_diagnostics_path is not None:
+        print(f"Mask diagnostics: {result.mask_diagnostics_path}")
+        print(f"Mask comparison sheet: {result.mask_diagnostics_sheet_path}")
 
 
 if __name__ == "__main__":

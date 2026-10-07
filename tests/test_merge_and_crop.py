@@ -3,6 +3,7 @@ import subprocess
 import csv
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,9 +13,23 @@ from tifffile import imwrite
 
 from brain_section_pipeline import select_nd2_files_dialog
 from brain_section_pipeline.crop import CropBox, crop_sections, detect_section_crops, save_crops, sort_crop_boxes
-from brain_section_pipeline.export import BrainGlobeExportConfig, _capture_atlas_metadata, export_sections_for_brainglobe
+from brain_section_pipeline.io import Nd2Image, Nd2RegionReader
+from brain_section_pipeline.export import (
+    BrainGlobeExportConfig,
+    BrainGlobeExportResult,
+    _capture_atlas_metadata,
+    export_sections_for_brainglobe,
+)
 from brain_section_pipeline.merge import merge_channels, robust_scale
-from brain_section_pipeline.pipeline import ProcessingResult, _preview_source_image, _raw_channels_to_rgb, _save_rgb_direct_crops
+from brain_section_pipeline.pipeline import (
+    PipelineConfig,
+    ProcessingResult,
+    _preview_source_image,
+    _raw_channels_to_rgb,
+    _save_direct_channel_crops,
+    _save_rgb_direct_crops,
+    process_nd2_file,
+)
 from brain_section_pipeline.brainreg_runner import BrainRegConfig, prepare_brainreg_run, run_prepared_brainreg
 from brain_section_pipeline.stack import StackBuildConfig, build_stack_from_manifest
 from brain_section_pipeline.atlas_summary import AtlasSummaryConfig, summarize_registered_slices_by_region
@@ -29,7 +44,9 @@ from brain_section_pipeline.atlas_indexing import (
 )
 from brain_section_pipeline.qc import SliceAtlasQcConfig, generate_slice_atlas_qc
 import brain_section_pipeline.atlas_indexing as atlas_indexing_module
+import brain_section_pipeline.pipeline as pipeline_module
 import brain_section_pipeline.slice_registration as slice_registration_module
+import brain_section_pipeline.slice_atlas as slice_atlas_module
 import brain_section_pipeline.workflow as workflow_module
 from brain_section_pipeline.slice_registration import SliceRegistrationConfig, register_slices_to_atlas
 from brain_section_pipeline.slice_atlas import SliceAtlasConfig, prepare_slice_atlas_inputs
@@ -356,7 +373,241 @@ def test_save_rgb_direct_crops_writes_each_crop_without_full_rgb_canvas(tmp_path
     assert np.all(first[..., 2] == 10)
 
 
+def test_save_direct_channel_crops_writes_final_outputs_without_raw_stack(tmp_path):
+    image = np.zeros((3, 20, 30), dtype=np.uint16)
+    image[0, 2:12, 3:13] = 10
+    image[1, 2:12, 3:13] = 20
+    image[2, 2:12, 3:13] = 30
+    boxes = [CropBox(2, 12, 3, 13, label=1, area=100, centroid_y=7, centroid_x=8)]
+
+    channel_paths, registration_paths = _save_direct_channel_crops(
+        image,
+        boxes,
+        channel_output_dir=tmp_path / "channels",
+        channel_export_channels=(0, 2),
+        registration_output_dir=tmp_path / "registration",
+        registration_channel=2,
+        extension="tif",
+        start_index=7,
+    )
+
+    assert set(channel_paths[0]) == {0, 2}
+    np.testing.assert_array_equal(imread(channel_paths[0][0]), np.full((10, 10), 10, dtype=np.uint16))
+    np.testing.assert_array_equal(imread(channel_paths[0][2]), np.full((10, 10), 30, dtype=np.uint16))
+    np.testing.assert_array_equal(imread(registration_paths[0]), np.full((10, 10), 30, dtype=np.uint16))
+
+
+def test_process_nd2_file_can_keep_review_data_in_memory_without_diagnostics(tmp_path, monkeypatch):
+    image = np.zeros((3, 40, 60), dtype=np.uint16)
+    image[:, 5:20, 5:20] = np.asarray([10, 20, 30])[:, None, None]
+    image[:, 5:20, 35:50] = np.asarray([10, 20, 30])[:, None, None]
+    input_path = tmp_path / "slide_01.nd2"
+
+    read_downsamples = []
+
+    def fake_read_nd2(path, **kwargs):
+        downsample = kwargs["downsample"]
+        read_downsamples.append(downsample)
+        return Nd2Image(
+            data=image[..., ::downsample, ::downsample],
+            path=Path(path),
+            dims=("C", "Y", "X"),
+            sizes={"C": 3, "Y": 40, "X": 60},
+            metadata={"voxel_size_um": {"x": 1.0, "y": 1.0}},
+        )
+
+    monkeypatch.setattr("brain_section_pipeline.pipeline.read_nd2_image", fake_read_nd2)
+
+    class FakeRegionReader:
+        def __init__(self, path, **kwargs):
+            self.image_shape = image.shape[-2:]
+            self.channel_count = image.shape[0]
+            self.sizes = {"C": 3, "Y": 40, "X": 60}
+            self.metadata = {"voxel_size_um": {"x": 1.0, "y": 1.0}}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return None
+
+        def read_region(self, y0, y1, x0, x1, *, channel):
+            return image[channel, y0:y1, x0:x1]
+
+    monkeypatch.setattr("brain_section_pipeline.pipeline.Nd2RegionReader", FakeRegionReader)
+
+    result = process_nd2_file(
+        input_path,
+        tmp_path / "slide_outputs",
+        config=PipelineConfig(
+            min_area=50,
+            margin=0,
+            opening_radius=0,
+            closing_iterations=0,
+            final_box_padding=0,
+            write_rgb_crops=False,
+            collect_rgb_review_thumbnails=True,
+        ),
+        channel_output_dir=tmp_path / "channels",
+        channel_export_channels=(1,),
+        registration_output_dir=tmp_path / "registration",
+        registration_channel=0,
+        write_diagnostics=False,
+    )
+
+    assert result.crop_paths == []
+    assert result.merged_path is None
+    assert result.metadata_path is None
+    assert not result.output_dir.exists()
+    assert len(result.review_thumbnails) == 2
+    assert all(path.exists() for path in result.registration_crop_paths)
+    assert all(paths[1].exists() for paths in result.channel_crop_paths)
+    assert read_downsamples == [4]
+    for box, paths, registration_path in zip(result.boxes, result.channel_crop_paths, result.registration_crop_paths):
+        np.testing.assert_array_equal(imread(paths[1]), image[1, box.y0 : box.y1, box.x0 : box.x1])
+        np.testing.assert_array_equal(imread(registration_path), image[0, box.y0 : box.y1, box.x0 : box.x1])
+
+
+def test_nd2_region_reader_selects_channel_and_projects_z(monkeypatch):
+    import dask.array as da
+    import brain_section_pipeline.io as io_module
+
+    pixels = np.arange(2 * 3 * 12 * 16, dtype=np.uint16).reshape(2, 3, 12, 16)
+
+    class FakeHandle:
+        sizes = {"Z": 2, "C": 3, "Y": 12, "X": 16}
+        metadata = None
+
+        def to_dask(self):
+            return da.from_array(pixels, chunks=(1, 1, 6, 8))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(io_module, "_import_nd2", lambda: SimpleNamespace(ND2File=lambda path: FakeHandle()))
+    with Nd2RegionReader("synthetic.nd2", z_projection="max") as reader:
+        assert reader.image_shape == (12, 16)
+        assert reader.channel_count == 3
+        result = reader.read_region(2, 9, 4, 13, channel=1)
+
+    np.testing.assert_array_equal(result, pixels[:, 1, 2:9, 4:13].max(axis=0))
+
+
+def test_roi_rgb_only_export_uses_requested_channels(tmp_path, monkeypatch):
+    image = np.zeros((4, 40, 60), dtype=np.uint16)
+    image[:, 5:25, 10:30] = np.asarray([10, 20, 30, 40])[:, None, None]
+
+    def fake_read(path, **kwargs):
+        step = kwargs["downsample"]
+        return Nd2Image(image[:, ::step, ::step], Path(path), ("C", "Y", "X"), {"C": 4, "Y": 40, "X": 60}, {})
+
+    class FakeReader:
+        image_shape = (40, 60)
+        channel_count = 4
+        sizes = {"C": 4, "Y": 40, "X": 60}
+        metadata = {}
+
+        def __init__(self, path, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return None
+
+        def read_region(self, y0, y1, x0, x1, *, channel):
+            return image[channel, y0:y1, x0:x1]
+
+    monkeypatch.setattr(pipeline_module, "read_nd2_image", fake_read)
+    monkeypatch.setattr(pipeline_module, "Nd2RegionReader", FakeReader)
+    result = process_nd2_file(
+        tmp_path / "slide.nd2",
+        tmp_path / "output",
+        config=PipelineConfig(
+            min_area=20,
+            margin=0,
+            opening_radius=0,
+            closing_iterations=0,
+            final_box_padding=0,
+            rgb_direct_channels=(2, 1, 0),
+        ),
+        write_diagnostics=False,
+    )
+
+    assert len(result.crop_paths) == 1
+    crop = imread(result.crop_paths[0])
+    box = result.boxes[0]
+    np.testing.assert_array_equal(crop[..., 0], image[2, box.y0:box.y1, box.x0:box.x1])
+    np.testing.assert_array_equal(crop[..., 2], image[0, box.y0:box.y1, box.x0:box.x1])
+
+
+def test_two_pass_detection_refines_to_full_resolution_baseline_boxes():
+    image = np.zeros((1, 400, 640), dtype=np.uint16)
+    image[0, 51:159, 67:197] = 100
+    image[0, 78:188, 333:487] = 120
+    image[0, 240:356, 122:274] = 90
+
+    config = PipelineConfig(
+        min_area=100,
+        margin=16,
+        opening_radius=0,
+        closing_iterations=0,
+        threshold_method="quantile",
+        threshold_quantile=0.5,
+        sort_mode="row_left_to_right",
+        final_box_padding=12,
+        detection_downsample=8,
+        detection_refinement_padding=64,
+    )
+    baseline = pipeline_module._detect_sections(image, config)
+    coarse = pipeline_module._detect_sections(image[..., ::8, ::8], config, downsample=8)
+    refined = pipeline_module._refine_coarse_boxes(
+        image,
+        coarse.boxes,
+        config=config,
+        downsample=8,
+    )
+
+    assert [(box.y0, box.y1, box.x0, box.x1) for box in refined] == [
+        (box.y0, box.y1, box.x0, box.x1) for box in baseline.boxes
+    ]
+
+
+def test_two_pass_detection_preserves_high_box_overlap_with_morphology():
+    image = np.zeros((1, 1024, 1024), dtype=np.uint16)
+    image[0, 120:520, 120:500] = 100
+    image[0, 530:900, 480:880] = 100
+    config = PipelineConfig(
+        min_area=10_000,
+        margin=40,
+        opening_radius=2,
+        closing_iterations=32,
+        threshold_method="quantile",
+        threshold_quantile=0.5,
+        final_box_padding=16,
+        detection_downsample=8,
+        detection_refinement_padding=128,
+    )
+    baseline = pipeline_module._detect_sections(image, config)
+    coarse = pipeline_module._detect_sections(image[..., ::8, ::8], config, downsample=8)
+    refined = pipeline_module._refine_coarse_boxes(
+        image,
+        coarse.boxes,
+        config=config,
+        downsample=8,
+    )
+
+    assert len(refined) == len(baseline.boxes)
+    for full_box, two_pass_box in zip(baseline.boxes, refined):
+        intersection = pipeline_module._box_intersection_area(full_box, two_pass_box)
+        union = full_box.height * full_box.width + two_pass_box.height * two_pass_box.width - intersection
+        assert intersection / union > 0.99
+
+
 def test_export_sections_for_brainglobe_writes_manifest_and_channel_exports(tmp_path, monkeypatch):
+    observed_configs = []
+
     def fake_process_nd2_file(
         path,
         output_dir,
@@ -366,7 +617,9 @@ def test_export_sections_for_brainglobe_writes_manifest_and_channel_exports(tmp_
         crop_start_index=1,
         crop_stem=None,
         crop_filename_template="{stem}_section{index:03d}.{extension}",
+        **kwargs,
     ):
+        observed_configs.append(config)
         input_path = Path(path)
         slide_dir = Path(output_dir) / input_path.stem
         slide_dir.mkdir(parents=True, exist_ok=True)
@@ -385,6 +638,8 @@ def test_export_sections_for_brainglobe_writes_manifest_and_channel_exports(tmp_
         boxes = []
         crop_paths = []
         raw_crop_paths = []
+        channel_crop_paths = []
+        registration_crop_paths = []
         for offset in range(2):
             section_index = crop_start_index + offset
             box = CropBox(
@@ -400,6 +655,7 @@ def test_export_sections_for_brainglobe_writes_manifest_and_channel_exports(tmp_
             boxes.append(box)
 
             rgb_path = Path(crop_output_dir) / f"section{section_index:03d}.tif"
+            rgb_path.parent.mkdir(parents=True, exist_ok=True)
             imwrite(rgb_path, np.full((4, 5, 3), section_index, dtype=np.uint8))
             crop_paths.append(rgb_path)
 
@@ -407,9 +663,22 @@ def test_export_sections_for_brainglobe_writes_manifest_and_channel_exports(tmp_
             raw[0] = section_index
             raw[1] = section_index + 100
             raw[2] = section_index + 200
-            raw_path = raw_dir / f"{input_path.stem}_section{offset + 1:03d}.tif"
-            imwrite(raw_path, raw, imagej=True, metadata={"axes": "CYX", "mode": "composite"})
-            raw_crop_paths.append(raw_path)
+            if config.save_raw_channel_crops:
+                raw_path = raw_dir / f"{input_path.stem}_section{offset + 1:03d}.tif"
+                imwrite(raw_path, raw, imagej=True, metadata={"axes": "CYX", "mode": "composite"})
+                raw_crop_paths.append(raw_path)
+
+            channel_paths = {}
+            for channel in range(3):
+                channel_path = Path(kwargs["channel_output_dir"]) / f"ch{channel}" / f"section{section_index:03d}.tif"
+                channel_path.parent.mkdir(parents=True, exist_ok=True)
+                imwrite(channel_path, raw[channel])
+                channel_paths[channel] = channel_path
+            channel_crop_paths.append(channel_paths)
+            registration_path = Path(kwargs["registration_output_dir"]) / f"section{section_index:03d}.tif"
+            registration_path.parent.mkdir(parents=True, exist_ok=True)
+            imwrite(registration_path, raw[kwargs["registration_channel"]])
+            registration_crop_paths.append(registration_path)
 
         return ProcessingResult(
             input_path=input_path,
@@ -418,9 +687,14 @@ def test_export_sections_for_brainglobe_writes_manifest_and_channel_exports(tmp_
             overlay_path=overlay_path,
             manifest_path=manifest_path,
             metadata_path=metadata_path,
-            crop_paths=crop_paths,
+            crop_paths=[],
             raw_crop_paths=raw_crop_paths,
             boxes=boxes,
+            detection_shape=(10, 10),
+            channel_count=3,
+            channel_crop_paths=channel_crop_paths,
+            registration_crop_paths=registration_crop_paths,
+            review_thumbnails=[np.full((4, 5, 3), 60, dtype=np.uint8) for _ in boxes],
         )
 
     monkeypatch.setattr("brain_section_pipeline.export.process_nd2_file", fake_process_nd2_file)
@@ -442,11 +716,17 @@ def test_export_sections_for_brainglobe_writes_manifest_and_channel_exports(tmp_
         rows = list(csv.DictReader(handle))
 
     assert len(rows) == 4
+    assert [row["section_index"] for row in rows] == ["1", "2", "3", "4"]
     assert [float(row["z_position_um"]) for row in rows] == [0.0, 120.0, 240.0, 360.0]
     assert all(row["atlas_name"] == "whs_sd_rat_39um" for row in rows)
     assert all(row["registration_channel"] == "1" for row in rows)
     assert rows[0]["pixel_size_x_um"] == "4.0"
     assert rows[0]["pixel_size_y_um"] == "5.0"
+    assert rows[0]["raw_crop_path"] == ""
+    assert observed_configs[0].preview_max_dim == 4096
+    assert not observed_configs[0].save_raw_channel_crops
+    assert not observed_configs[0].write_rgb_crops
+    assert observed_configs[0].collect_rgb_review_thumbnails
 
     registration = imread(result.sections_registration_dir / "section001.tif")
     np.testing.assert_array_equal(registration, np.full((4, 5), 101, dtype=np.uint16))
@@ -458,6 +738,97 @@ def test_export_sections_for_brainglobe_writes_manifest_and_channel_exports(tmp_
 
     metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
     assert metadata["atlas_metadata"] == {"name": "whs_sd_rat_39um"}
+    assert len(result.slide_overlay_paths) == 2
+    assert all(path.exists() for path in result.slide_overlay_paths)
+    assert result.section_montage_path.exists()
+    assert Image.open(result.section_montage_path).size == (1672, 292)
+
+
+def test_export_section_review_uses_numeric_slide_and_global_left_to_right_order(tmp_path, monkeypatch):
+    processed_paths = []
+    overlay_indices = []
+
+    def fake_process_nd2_file(path, output_dir, config=None, **kwargs):
+        input_path = Path(path)
+        processed_paths.append((input_path.name, config.sort_mode, kwargs["crop_start_index"]))
+        slide_dir = Path(output_dir) / input_path.stem
+        slide_dir.mkdir(parents=True, exist_ok=True)
+        raw_dir = slide_dir / "raw_channel_crops"
+        raw_dir.mkdir(exist_ok=True)
+        merged_path = slide_dir / "merged.tif"
+        overlay_path = slide_dir / "overlay.png"
+        metadata_path = slide_dir / "metadata.json"
+        manifest_path = slide_dir / "manifest.csv"
+        imwrite(merged_path, np.zeros((20, 30, 3), dtype=np.uint8))
+        Image.new("RGB", (20, 30)).save(overlay_path)
+        metadata_path.write_text(json.dumps({"nd2": {}}), encoding="utf-8")
+        manifest_path.write_text("section_index\n", encoding="utf-8")
+        start = kwargs["crop_start_index"]
+        boxes = [
+            CropBox(1, 8, 2, 10, label=1, area=48, centroid_y=4.5, centroid_x=6.0),
+            CropBox(1, 8, 12, 20, label=2, area=48, centroid_y=4.5, centroid_x=16.0),
+        ]
+        crop_paths = []
+        raw_paths = []
+        channel_crop_paths = []
+        registration_crop_paths = []
+        for offset in range(2):
+            crop_path = Path(kwargs["crop_output_dir"]) / f"section{start + offset:03d}.tif"
+            crop_path.parent.mkdir(parents=True, exist_ok=True)
+            imwrite(crop_path, np.full((4, 5, 3), start + offset, dtype=np.uint8))
+            crop_paths.append(crop_path)
+            raw_path = raw_dir / f"raw{offset}.tif"
+            imwrite(raw_path, np.full((3, 4, 5), start + offset, dtype=np.uint16))
+            if config.save_raw_channel_crops:
+                raw_paths.append(raw_path)
+            channel_paths = {}
+            for channel in range(3):
+                channel_path = Path(kwargs["channel_output_dir"]) / f"ch{channel}" / f"section{start + offset:03d}.tif"
+                channel_path.parent.mkdir(parents=True, exist_ok=True)
+                imwrite(channel_path, np.full((4, 5), start + offset + channel, dtype=np.uint16))
+                channel_paths[channel] = channel_path
+            channel_crop_paths.append(channel_paths)
+            registration_path = Path(kwargs["registration_output_dir"]) / f"section{start + offset:03d}.tif"
+            registration_path.parent.mkdir(parents=True, exist_ok=True)
+            imwrite(registration_path, np.full((4, 5), start + offset, dtype=np.uint16))
+            registration_crop_paths.append(registration_path)
+        return ProcessingResult(
+            input_path=input_path,
+            output_dir=slide_dir,
+            merged_path=merged_path,
+            overlay_path=overlay_path,
+            manifest_path=manifest_path,
+            metadata_path=metadata_path,
+            crop_paths=crop_paths,
+            raw_crop_paths=raw_paths,
+            boxes=boxes,
+            detection_shape=(20, 30),
+            channel_count=3,
+            channel_crop_paths=channel_crop_paths,
+            registration_crop_paths=registration_crop_paths,
+        )
+
+    def fake_overlay(merged_path, boxes, output_path, *, first_section_index, source_shape):
+        overlay_indices.append((Path(merged_path).parent.name, first_section_index))
+        Image.new("RGB", (20, 30)).save(output_path)
+
+    monkeypatch.setattr("brain_section_pipeline.export.process_nd2_file", fake_process_nd2_file)
+    monkeypatch.setattr("brain_section_pipeline.export._write_numbered_slide_overlay", fake_overlay)
+    monkeypatch.setattr("brain_section_pipeline.export._capture_atlas_metadata", lambda atlas_name: None)
+
+    result = export_sections_for_brainglobe(
+        ["slide_10.nd2", "slide_2.nd2", "slide_1.nd2"],
+        tmp_path,
+        export_config=BrainGlobeExportConfig(sample_id="rat_01"),
+    )
+
+    assert processed_paths == [
+        ("slide_1.nd2", "row_left_to_right", 1),
+        ("slide_2.nd2", "row_left_to_right", 3),
+        ("slide_10.nd2", "row_left_to_right", 5),
+    ]
+    assert overlay_indices == [("slide_1", 1), ("slide_2", 3), ("slide_10", 5)]
+    assert Image.open(result.section_montage_path).size == (1672, 572)
 
 
 def test_capture_atlas_metadata_returns_none_without_brainglobe(monkeypatch):
@@ -835,6 +1206,8 @@ def test_prepare_slice_atlas_inputs_exports_reference_and_annotation_planes(tmp_
     exported_annotation = imread(result.atlas_annotation_dir / "section002_atlas_annotation.tif")
     assert exported_reference.shape == (5, 6)
     assert exported_annotation.shape == (5, 6)
+    assert result.section_source_dir is None
+    assert pairing_rows[0]["section_source_path"] == str(registration_dir / "section001.tif")
 
 
 def test_prepare_slice_atlas_inputs_raises_without_brainglobe(monkeypatch, tmp_path):
@@ -856,6 +1229,125 @@ def test_prepare_slice_atlas_inputs_raises_without_brainglobe(monkeypatch, tmp_p
         assert "atlasapi" in str(exc)
     else:
         raise AssertionError("Expected prepare_slice_atlas_inputs to raise ImportError.")
+
+
+@pytest.mark.parametrize(
+    ("requested_ap_mm", "source_voxel", "expected_index"),
+    [
+        (0.0, 623, 400),
+        (3.9, 723, 300),
+        (4.9, 748, 275),
+        (5.8, 771, 252),
+    ],
+)
+def test_whs_ap_mm_uses_published_origin_and_source_voxel_spacing(requested_ap_mm, source_voxel, expected_index):
+    index, actual_ap_mm = slice_atlas_module._slice_assignment_for_row(
+        {"section_index": "1", "whs_ap_mm": str(requested_ap_mm)},
+        0,
+        SliceAtlasConfig(),
+        (1024, 512, 512),
+        "asr",
+        [39.0, 39.0, 39.0],
+        "3.0",
+        0,
+    )
+    assert expected_index == 1023 - source_voxel
+    assert index == expected_index
+    assert actual_ap_mm == pytest.approx((source_voxel - 623) * 0.0390625)
+
+
+def test_whs_ap_index_reversal_matches_brainglobe_space_stack_mapping():
+    brainglobe_space = pytest.importorskip("brainglobe_space")
+    source = np.zeros((4, 7, 5), dtype=np.uint8)
+    source[2, 3, 1] = 1
+    mapped = brainglobe_space.AnatomicalSpace("lpi", shape=source.shape).map_stack_to(
+        brainglobe_space.AnatomicalSpace("asr", shape=(7, 5, 4)), source
+    )
+    mapped_ap_index = int(np.argwhere(mapped == 1)[0, 0])
+    assert mapped_ap_index == 7 - 1 - 3
+
+
+@pytest.mark.parametrize(
+    ("row", "config", "shape", "orientation", "resolution", "version", "error"),
+    [
+        ({"whs_ap_mm": "3.9", "atlas_slice_index": "300"}, SliceAtlasConfig(), (1024, 512, 512), "asr", [39.0] * 3, "3.0", "both"),
+        ({"whs_ap_mm": "unknown"}, SliceAtlasConfig(), (1024, 512, 512), "asr", [39.0] * 3, "3.0", "invalid"),
+        ({"whs_ap_mm": "nan"}, SliceAtlasConfig(), (1024, 512, 512), "asr", [39.0] * 3, "3.0", "finite"),
+        ({"whs_ap_mm": "100"}, SliceAtlasConfig(), (1024, 512, 512), "asr", [39.0] * 3, "3.0", "outside"),
+        ({"whs_ap_mm": "3.9"}, SliceAtlasConfig(atlas_name="other_atlas"), (1024, 512, 512), "asr", [39.0] * 3, "3.0", "requires"),
+        ({"whs_ap_mm": "3.9"}, SliceAtlasConfig(), (1000, 512, 512), "asr", [39.0] * 3, "3.0", "validated"),
+        ({"whs_ap_mm": "3.9"}, SliceAtlasConfig(), (1024, 512, 512), "asr", [50.0] * 3, "3.0", "validated"),
+        ({"whs_ap_mm": "3.9"}, SliceAtlasConfig(), (1024, 512, 512), "asr", [39.0] * 3, "3.1", "validated"),
+        ({"whs_ap_mm": "3.9"}, SliceAtlasConfig(), (512, 1024, 512), "lpi", [39.0] * 3, "3.0", "validated"),
+    ],
+)
+def test_whs_ap_mm_rejects_ambiguous_or_incompatible_inputs(row, config, shape, orientation, resolution, version, error):
+    with pytest.raises(ValueError, match=error):
+        slice_atlas_module._slice_assignment_for_row(
+            {"section_index": "1", **row}, 0, config, shape, orientation, resolution, version, 0
+        )
+
+
+def test_prepare_slice_atlas_inputs_accepts_whs_ap_mm_per_section(tmp_path, monkeypatch):
+    registration_dir = tmp_path / "sections_registration"
+    registration_dir.mkdir()
+    rows = []
+    for section_index, ap_mm in enumerate((3.9, 4.9, 5.8), start=1):
+        section_path = registration_dir / f"section{section_index:03d}.tif"
+        imwrite(section_path, np.ones((4, 4), dtype=np.uint16))
+        rows.append(
+            {
+                "section_index": section_index,
+                "crop_path_registration": str(section_path),
+                "include_in_stack": "true",
+                "whs_ap_mm": ap_mm,
+            }
+        )
+    manifest_path = tmp_path / "section_manifest.csv"
+    with manifest_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    class FakeAtlas:
+        orientation = "asr"
+        resolution = (39.0, 39.0, 39.0)
+        metadata = {"version": "3.0"}
+        reference = np.broadcast_to(np.arange(1024, dtype=np.uint16)[:, None, None], (1024, 512, 512))
+        annotation = np.broadcast_to(np.arange(1024, dtype=np.uint16)[:, None, None], (1024, 512, 512))
+
+    monkeypatch.setattr("brain_section_pipeline.slice_atlas._load_atlas", lambda atlas_name: FakeAtlas())
+    result = prepare_slice_atlas_inputs(manifest_path)
+    with result.manifest_path.open("r", encoding="utf-8", newline="") as handle:
+        paired = list(csv.DictReader(handle))
+
+    assert [int(row["atlas_slice_index"]) for row in paired] == [300, 275, 252]
+    assert [float(row["whs_ap_mm"]) for row in paired] == [3.9, 4.9, 5.8]
+    assert [float(row["atlas_plane_whs_ap_mm"]) for row in paired] == pytest.approx(
+        [3.90625, 4.8828125, 5.78125]
+    )
+    for row in paired:
+        assert np.all(imread(row["atlas_reference_path"]) == int(row["atlas_slice_index"]))
+        assert np.all(imread(row["atlas_annotation_path"]) == int(row["atlas_slice_index"]))
+    with result.metadata_path.open("r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    assert metadata["whs_ap_calibration"]["source_ap_origin_voxel"] == 623
+    assert metadata["whs_ap_calibration"]["source_voxel_size_mm"] == 0.0390625
+
+
+def test_blank_whs_ap_mm_preserves_explicit_atlas_index():
+    index, plane_ap_mm = slice_atlas_module._slice_assignment_for_row(
+        {"section_index": "1", "whs_ap_mm": "", "atlas_slice_index": "321"},
+        0,
+        SliceAtlasConfig(),
+        (1024, 512, 512),
+        "asr",
+        [39.0, 39.0, 39.0],
+        "3.0",
+        0,
+    )
+    assert index == 321
+    assert plane_ap_mm is None
 
 
 def test_atlas_index_ap_conversion_matches_whs_axis_convention():
@@ -1661,7 +2153,7 @@ def test_register_slices_to_atlas_writes_warped_outputs_and_metrics(tmp_path):
 
     result = register_slices_to_atlas(
         manifest_path,
-        config=SliceRegistrationConfig(max_rotation_degrees=30.0),
+        config=SliceRegistrationConfig(max_rotation_degrees=30.0, save_individual_overlays=True),
     )
 
     with result.manifest_path.open("r", encoding="utf-8", newline="") as handle:
@@ -1670,6 +2162,8 @@ def test_register_slices_to_atlas_writes_warped_outputs_and_metrics(tmp_path):
     assert len(result.section_indices) == 1
     assert Path(registered_rows[0]["warped_section_path"]).exists()
     assert Path(registered_rows[0]["registration_overlay_path"]).exists()
+    assert result.contact_sheet_path is not None
+    assert result.contact_sheet_path.exists()
     assert float(registered_rows[0]["registration_dice"]) > 0.75
 
     warped = imread(registered_rows[0]["warped_section_path"])
@@ -1677,6 +2171,26 @@ def test_register_slices_to_atlas_writes_warped_outputs_and_metrics(tmp_path):
 
     metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
     assert metadata["rows"][0]["registration_dice"] > 0.75
+
+    compact_result = register_slices_to_atlas(
+        manifest_path,
+        pairing_dir / "compact_registration",
+        config=SliceRegistrationConfig(max_rotation_degrees=30.0, low_quality_dice_threshold=0.0, save_mask_diagnostics=True),
+    )
+    compact_rows = list(csv.DictReader(compact_result.manifest_path.open(encoding="utf-8", newline="")))
+    assert compact_rows[0]["registration_overlay_path"] == ""
+    assert compact_result.contact_sheet_path is not None
+    assert compact_result.contact_sheet_path.exists()
+    assert not compact_result.overlay_dir.exists()
+    assert compact_result.mask_diagnostics_path is not None
+    assert compact_result.mask_diagnostics_sheet_path is not None
+    assert compact_result.mask_diagnostics_sheet_path.exists()
+    comparison = list(csv.DictReader(compact_result.mask_diagnostics_path.open(encoding="utf-8", newline="")))
+    assert len(comparison) == 1
+    assert 0.0 <= float(comparison[0]["bright_dice"]) <= 1.0
+    assert 0.0 <= float(comparison[0]["envelope_dice"]) <= 1.0
+    assert result.mask_diagnostics_path is None
+    assert result.mask_diagnostics_sheet_path is None
 
 
 def test_slice_registration_initial_scale_uses_bbox_fit_by_default():
@@ -1777,6 +2291,61 @@ def test_display_tissue_mask_is_more_permissive_than_registration_mask():
     assert display_mask.sum() > registration_mask.sum()
     assert display_mask[10, 12]
     assert not registration_mask[10, 12]
+
+
+def test_registration_envelope_uses_dim_tissue_with_bright_crop_and_preserves_bright_mode():
+    image = np.zeros((80, 120), dtype=np.float32)
+    image[15:65, 20:35] = 20.0
+    image[15:65, 85:100] = 20.0
+    image[50:65, 20:100] = 20.0
+    image[15:25, 20:35] = 100.0
+    image[15:25, 85:100] = 100.0
+    image[55:65, 50:70] = 100.0
+
+    envelope = slice_registration_module._prepare_section_registration_input(image, SliceRegistrationConfig())
+    bright = slice_registration_module._prepare_section_registration_input(
+        image, SliceRegistrationConfig(tissue_mask_mode="bright")
+    )
+
+    assert envelope is not None
+    assert bright is not None
+    assert np.array_equal(envelope.section_crop, bright.section_crop)
+    assert np.array_equal(bright.section_mask_crop, bright.section_bright_mask_crop)
+    assert envelope.section_mask_crop.sum() > bright.section_mask_crop.sum()
+    assert envelope.section_mask_crop[30, 5]
+    assert not bright.section_mask_crop[30, 5]
+
+
+def test_mask_comparison_metrics_use_the_same_atlas_area_for_both_masks():
+    atlas = np.zeros((10, 10), dtype=bool)
+    atlas[2:8, 2:8] = True
+    bright = np.zeros_like(atlas)
+    bright[3:7, 3:7] = True
+    envelope = np.zeros_like(atlas)
+    envelope[2:8, 2:8] = True
+    envelope[2, 1] = True
+
+    bright_metrics = slice_registration_module._mask_comparison_metrics(bright, atlas)
+    envelope_metrics = slice_registration_module._mask_comparison_metrics(envelope, atlas)
+
+    assert bright_metrics["dice"] == pytest.approx(32 / 52)
+    assert bright_metrics["inside_fraction"] == pytest.approx(1.0)
+    assert envelope_metrics["area_ratio"] == pytest.approx(37 / 36)
+    assert envelope_metrics["inside_fraction"] == pytest.approx(36 / 37)
+    assert envelope_metrics["dice"] == pytest.approx(72 / 73)
+
+
+def test_mask_diagnostics_reject_nonlinear_refinement_before_creating_outputs(tmp_path):
+    output_dir = tmp_path / "registration"
+    manifest_path = tmp_path / "pairing.csv"
+    manifest_path.write_text("section_index\n1\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="nonlinear_refinement_model"):
+        register_slices_to_atlas(
+            manifest_path,
+            output_dir,
+            config=SliceRegistrationConfig(save_mask_diagnostics=True, nonlinear_refinement_model="boundary_spline"),
+        )
+    assert not output_dir.exists()
 
 
 def test_slice_registration_loss_penalizes_oversized_warped_masks():
@@ -1962,10 +2531,13 @@ def test_register_slices_to_atlas_handles_empty_masks(tmp_path):
         writer.writeheader()
         writer.writerows(rows)
 
-    result = register_slices_to_atlas(manifest_path)
+    result = register_slices_to_atlas(manifest_path, config=SliceRegistrationConfig(save_mask_diagnostics=True))
 
     metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
     assert metadata["rows"][0]["registration_status"] == "empty_mask"
+    diagnostic_rows = list(csv.DictReader(result.mask_diagnostics_path.open(encoding="utf-8", newline="")))
+    assert float(diagnostic_rows[0]["bright_dice"]) == 0.0
+    assert float(diagnostic_rows[0]["envelope_dice"]) == 0.0
 
 
 def test_summarize_registered_slices_by_region_writes_section_and_aggregate_rows(tmp_path, monkeypatch):
@@ -2137,6 +2709,9 @@ def test_run_slicewise_atlas_workflow_orchestrates_all_sparse_stages(tmp_path, m
         sections_registration_dir=sample_dir / "sections_registration",
         sections_channels_dir=sample_dir / "sections_channels",
         qc_dir=sample_dir / "qc",
+        review_dir=sample_dir / "qc" / "section_review",
+        slide_overlay_paths=[],
+        section_montage_path=sample_dir / "qc" / "section_review" / "all_detected_sections.png",
         processing_results=[],
     )
     slice_result = workflow_module.SliceAtlasResult(
@@ -2199,6 +2774,7 @@ def test_run_slicewise_atlas_workflow_orchestrates_all_sparse_stages(tmp_path, m
     result = workflow_module.run_slicewise_atlas_workflow(
         input_path,
         tmp_path / "outputs",
+        generate_qc=True,
     )
 
     assert result.export_result is export_result
@@ -2240,6 +2816,9 @@ def test_run_slicewise_atlas_workflow_can_skip_qc_and_summary(tmp_path, monkeypa
         sections_registration_dir=sample_dir / "sections_registration",
         sections_channels_dir=sample_dir / "sections_channels",
         qc_dir=sample_dir / "qc",
+        review_dir=sample_dir / "qc" / "section_review",
+        slide_overlay_paths=[],
+        section_montage_path=sample_dir / "qc" / "section_review" / "all_detected_sections.png",
         processing_results=[],
     )
     slice_result = workflow_module.SliceAtlasResult(

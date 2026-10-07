@@ -108,7 +108,7 @@ Expected outputs for this stage:
 
 ```text
 sample_id/
-  sections_rgb/
+  sections_registration/
     section001.tif
     section002.tif
   sections_channels/
@@ -116,7 +116,9 @@ sample_id/
     ch1/
     ch2/
   qc/
-    slide_crop_overlays/
+    section_review/
+      slide001_detected_sections.png
+      all_detected_sections.png
   section_manifest.csv
 ```
 
@@ -399,7 +401,6 @@ pipeline_config = PipelineConfig(
     mask_channel=0,
     min_area=1_000_000,
     margin=250,
-    sort_mode="row_right_to_left",
 )
 
 export_config = BrainGlobeExportConfig(
@@ -430,20 +431,63 @@ outputs/
   rat_01/
     section_manifest.csv
     sample_metadata.json
-    sections_rgb/
     sections_registration/
     sections_channels/
       ch0/
       ch1/
       ch2/
     qc/
-      slide_crop_overlays/
-    slide_outputs/
+      section_review/
+        slide001_detected_sections.png
+        slide002_detected_sections.png
+        all_detected_sections.png
 ```
 
-The most important handoff file is `section_manifest.csv`. It records the
-global section index, slide source, crop geometry, exported file paths, pixel
-size, section spacing, z position, registration channel, and QC status.
+The intended first review is deliberately small: open
+`qc/section_review/all_detected_sections.png` and the per-slide
+`slide*_detected_sections.png` files. Input slide files are naturally sorted
+by their numeric names (`1.nd2`, `2.nd2`, ..., `10.nd2`); detected sections are
+then numbered left-to-right within each slide. The combined image preserves
+that global numbering and displays five sections per row.
+
+`section_manifest.csv`, channel TIFFs, and registration TIFFs remain internal
+handoff artifacts for later atlas registration. They do not need routine
+inspection at this stage.
+
+To keep large datasets compact, full-resolution RGB crops and per-slide
+diagnostic files are disabled in the default BrainGlobe export. The montage is
+assembled from bounded in-memory thumbnails, so it does not require
+`sections_rgb/`. Restore either diagnostic class only when needed:
+
+```python
+export_config = BrainGlobeExportConfig(
+    sample_id="rat_01",
+    write_rgb_crops=True,
+    write_slide_diagnostics=True,
+)
+```
+
+For large slides, BrainGlobe export limits full-slide preview and review images
+to 4,096 pixels on their longest side by default. Section detection and the
+exported section crops remain full resolution. Detection first runs on an
+4-times downsampled ND2 representation, maps each candidate back to the full
+slide, and refines its final bounds locally at full resolution. Set
+`detection_downsample=1` to restore the prior all-full-resolution detection
+path, or tune the candidate window with `detection_refinement_padding` when a
+slide contains unusually large tears or section fragments. The exporter also
+writes final channel and registration TIFFs from bounded ND2 regions, reading
+one channel at a time. It no longer loads the entire full-resolution slide in
+the normal two-pass path. The `detection_downsample=1` compatibility path still
+loads the full slide. Set
+`keep_raw_channel_crops=True` only when a legacy workflow specifically needs
+those intermediate stacks:
+
+```python
+export_config = BrainGlobeExportConfig(
+    sample_id="rat_01",
+    keep_raw_channel_crops=True,
+)
+```
 
 ## Slice-Wise Atlas Mode
 
@@ -470,10 +514,39 @@ slice_result = prepare_slice_atlas_inputs(
 ```
 
 This writes one atlas reference plane and one atlas annotation plane per
-selected section.
+selected section. By default, the pairing manifest points directly to the
+existing registration image rather than copying it into `slice_atlas/sections/`.
+Set `copy_section_source=True` only when a self-contained pairing directory is
+needed for transfer or archival.
 
-If you know only an approximate AP coordinate or atlas index, use the atlas
-index suggester before committing to a slice-atlas manifest:
+The main workflow bypasses automatic atlas-index suggestion. Assign the atlas
+plane directly after reviewing the exported section montage. For the
+`whs_sd_rat_39um` atlas, add a `whs_ap_mm` column to the existing section
+manifest and enter each selected slice's **Waxholm-native** AP position in
+millimetres (positive is anterior to the WHS origin). For example, values
+`3.9`, `4.9`, and `5.8` select atlas indices
+`300`, `275`, and `252` in the validated BrainGlobe v3.0 atlas. Leave
+`atlas_slice_index` blank on those rows; specifying both is an error.
+
+`prepare_slice_atlas_inputs` records the requested `whs_ap_mm`, the chosen
+zero-based `atlas_slice_index`, and `atlas_plane_whs_ap_mm`, the coordinate
+actually represented by that voxel. It rejects other atlas versions or
+layouts until their coordinate calibration is verified. The published source
+volume has AP origin voxel 623 and 0.0390625 mm voxel spacing
+([WHS coordinate reference](https://www.nitrc.org/docman/view.php/1081/2095/Coordinates_v1-v1.01.pdf));
+BrainGlobe v3.0 reorients its 1024-plane AP axis so index 0 is anterior
+([BrainGlobe orientation convention](https://brainglobe.info/documentation/setting-up/image-definition.html)).
+This is distinct
+from Bregma-referenced AP coordinates and from one-based atlas viewer slice
+numbers. Rows without `whs_ap_mm` continue to use an explicit
+`atlas_slice_index` or `start_slice_index` and `slice_index_step`.
+
+The optional `suggest_atlas_indices` helper below retains its historical
+volume-centre AP approximation; do not use its `ap_mm_to_atlas_index` helper
+to convert Waxholm-native AP positions for direct pairing.
+
+`suggest_atlas_indices(...)` remains available as an optional advanced tool
+when direct atlas-plane assignment is insufficient:
 
 ```python
 from brain_section_pipeline import AtlasIndexSuggestionConfig, suggest_atlas_indices
@@ -653,7 +726,7 @@ python scripts\suggest_atlas_indices.py outputs\rat_01\section_manifest.csv `
   --top-n 5
 ```
 
-Then generate coarse review overlays:
+Optionally generate coarse review overlays:
 
 ```python
 from brain_section_pipeline import SliceAtlasQcConfig, generate_slice_atlas_qc
@@ -785,8 +858,31 @@ registration_result = register_slices_to_atlas(
 This stage writes:
 
 - a warped section image for each atlas-paired slice;
-- a registration overlay for visual review;
+- one five-column registration contact sheet for visual review;
+- individual registration overlays only for failed or low-Dice fits by default;
 - a registration manifest with transform parameters and overlap metrics.
+
+Registration now fits and scores a fuller tissue-envelope mask by default.
+The envelope uses the existing lower-threshold boundary mask, with small-gap
+closing and speck removal. The bright 0.8-quantile mask still defines the
+source crop, so crop coordinates remain comparable with earlier runs. The
+display mask remains separate. Set `tissue_mask_mode="bright"` (or pass
+`--tissue-mask-mode bright`) to retain the earlier fitting/scoring mask.
+`boundary_fit_threshold_quantile` controls the envelope threshold; the
+default is 0.35.
+
+For a mask comparison at the *same* fitted transform, set
+`save_mask_diagnostics=True` (or pass `--save-mask-diagnostics`). This adds one
+CSV with bright/envelope Dice, area ratio, and inside fraction, plus one
+two-column mask contact sheet. It is off by default for large batches, and
+currently requires nonlinear refinement to be disabled. A higher Dice from
+a fuller mask does not alone demonstrate better anatomical alignment; review
+the red mask against the tissue and the green atlas outline in the sheet.
+
+Set `save_individual_overlays=True` (or pass `--save-individual-overlays`) to
+retain every full-resolution overlay. The default low-quality cutoff is Dice
+`0.80`; tune it with `low_quality_dice_threshold` or
+`--low-quality-dice-threshold`.
 
 The default transform model is slice-wise similarity registration
 (scale/rotation/translation) against the selected 2D atlas plane, with an

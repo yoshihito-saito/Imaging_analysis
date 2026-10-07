@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageOps
 from scipy import ndimage
 from tifffile import imread, imwrite
 
@@ -18,6 +18,7 @@ ScaleInitialization = Literal["bbox_fit", "area"]
 TranslationInitialization = Literal["crop_center", "tissue_centroid"]
 TransformModel = Literal["similarity", "affine"]
 NonlinearRefinementModel = Literal["none", "boundary_spline"]
+TissueMaskMode = Literal["bright", "envelope"]
 
 
 @dataclass(frozen=True)
@@ -56,8 +57,13 @@ class SliceRegistrationConfig:
     nonlinear_control_point_spacing_px: float = 48.0
     nonlinear_iterations: int = 2
     nonlinear_boundary_sample_step: int = 3
+    save_individual_overlays: bool = False
+    low_quality_dice_threshold: float = 0.80
+    contact_sheet_name: str = "registration_contact_sheet.png"
     output_name: str = "slice_registration_manifest.csv"
     metadata_name: str = "slice_registration_metadata.json"
+    tissue_mask_mode: TissueMaskMode = "envelope"
+    save_mask_diagnostics: bool = False
 
 
 @dataclass(frozen=True)
@@ -70,6 +76,9 @@ class SliceRegistrationResult:
     warped_sections_dir: Path
     overlay_dir: Path
     section_indices: list[int]
+    contact_sheet_path: Path | None = None
+    mask_diagnostics_path: Path | None = None
+    mask_diagnostics_sheet_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +87,8 @@ class _PreparedSectionRegistrationInput:
     section_mask_crop: np.ndarray
     section_display_mask_crop: np.ndarray
     section_boundary_mask_crop: np.ndarray
+    section_bright_mask_crop: np.ndarray
+    section_envelope_mask_crop: np.ndarray
 
 
 def register_slices_to_atlas(
@@ -93,18 +104,22 @@ def register_slices_to_atlas(
     rows = _read_manifest_rows(manifest)
     if not rows:
         raise ValueError("The slice-wise atlas manifest is empty.")
+    if cfg.tissue_mask_mode not in ("bright", "envelope"):
+        raise ValueError("tissue_mask_mode must be one of: 'bright', 'envelope'.")
+    if cfg.save_mask_diagnostics and cfg.nonlinear_refinement_model != "none":
+        raise ValueError("Mask diagnostics require nonlinear_refinement_model='none'.")
 
     registration_dir = Path(output_dir) if output_dir is not None else manifest.parent / "slice_registration"
     warped_sections_dir = registration_dir / "warped_sections"
     overlay_dir = registration_dir / "overlays"
     affine_overlay_dir = registration_dir / "affine_overlays"
     warped_sections_dir.mkdir(parents=True, exist_ok=True)
-    overlay_dir.mkdir(parents=True, exist_ok=True)
-    if cfg.nonlinear_refinement_model != "none":
-        affine_overlay_dir.mkdir(parents=True, exist_ok=True)
 
     output_rows: list[dict[str, Any]] = []
     section_indices: list[int] = []
+    overlay_thumbnails: list[tuple[int, np.ndarray]] = []
+    diagnostic_rows: list[dict[str, float | int]] = []
+    diagnostic_thumbnails: list[tuple[int, np.ndarray, np.ndarray, float, float]] = []
 
     for row in rows:
         section_index = int(row["section_index"])
@@ -120,17 +135,48 @@ def register_slices_to_atlas(
             config=cfg,
         )
         registration.pop("_warped_mask", None)
+        diagnostic_masks = registration.pop("_diagnostic_masks", None)
         warped_display_mask = registration.pop("_warped_display_mask", None)
         affine_warped_section = registration.pop("_affine_warped_section", None)
         affine_warped_display_mask = registration.pop("_affine_warped_display_mask", None)
         overlay = _compose_overlay(warped_section, atlas_reference, atlas_mask, cfg, section_mask=warped_display_mask)
 
         warped_path = warped_sections_dir / f"section{section_index:03d}_warped.tif"
-        overlay_path = overlay_dir / f"section{section_index:03d}_overlay.png"
         imwrite(warped_path, warped_section.astype(np.float32))
-        Image.fromarray(overlay, mode="RGB").save(overlay_path)
+        overlay_thumbnails.append((section_index, _overlay_thumbnail(overlay)))
+        if cfg.save_mask_diagnostics:
+            if diagnostic_masks is None:
+                empty_mask = np.zeros_like(atlas_mask, dtype=bool)
+                diagnostic_masks = (empty_mask, empty_mask)
+            bright_mask, envelope_mask = diagnostic_masks
+            bright_metrics = _mask_comparison_metrics(bright_mask, atlas_mask)
+            envelope_metrics = _mask_comparison_metrics(envelope_mask, atlas_mask)
+            diagnostic_rows.append({
+                "section_index": section_index,
+                **{f"bright_{key}": value for key, value in bright_metrics.items()},
+                **{f"envelope_{key}": value for key, value in envelope_metrics.items()},
+            })
+            diagnostic_thumbnails.append((
+                section_index,
+                _mask_comparison_thumbnail(warped_section, atlas_mask, bright_mask),
+                _mask_comparison_thumbnail(warped_section, atlas_mask, envelope_mask),
+                bright_metrics["dice"],
+                envelope_metrics["dice"],
+            ))
+        save_overlay = (
+            cfg.save_individual_overlays
+            or registration["status"] != "ok"
+            or float(registration["dice"]) < cfg.low_quality_dice_threshold
+        )
+        overlay_path = ""
+        if save_overlay:
+            overlay_dir.mkdir(parents=True, exist_ok=True)
+            overlay_path_obj = overlay_dir / f"section{section_index:03d}_overlay.png"
+            Image.fromarray(overlay, mode="RGB").save(overlay_path_obj)
+            overlay_path = str(overlay_path_obj)
         affine_overlay_path = ""
-        if affine_warped_section is not None:
+        if affine_warped_section is not None and cfg.save_individual_overlays:
+            affine_overlay_dir.mkdir(parents=True, exist_ok=True)
             affine_overlay = _compose_overlay(
                 affine_warped_section,
                 atlas_reference,
@@ -146,9 +192,10 @@ def register_slices_to_atlas(
             {
                 **row,
                 "warped_section_path": str(warped_path),
-                "registration_overlay_path": str(overlay_path),
+                "registration_overlay_path": overlay_path,
                 "registration_affine_overlay_path": affine_overlay_path,
                 "registration_status": registration["status"],
+                "registration_tissue_mask_mode": cfg.tissue_mask_mode,
                 "registration_loss": registration["loss"],
                 "registration_dice": registration["dice"],
                 "registration_iou": registration["iou"],
@@ -183,6 +230,15 @@ def register_slices_to_atlas(
 
     manifest_path = registration_dir / cfg.output_name
     metadata_path = registration_dir / cfg.metadata_name
+    contact_sheet_path = registration_dir / cfg.contact_sheet_name
+    _write_overlay_contact_sheet(overlay_thumbnails, contact_sheet_path)
+    mask_diagnostics_path = None
+    mask_diagnostics_sheet_path = None
+    if cfg.save_mask_diagnostics:
+        mask_diagnostics_path = registration_dir / "registration_mask_diagnostics.csv"
+        mask_diagnostics_sheet_path = registration_dir / "registration_mask_diagnostics.png"
+        _write_manifest(mask_diagnostics_path, diagnostic_rows)
+        _write_mask_diagnostic_sheet(diagnostic_thumbnails, mask_diagnostics_sheet_path)
     _write_manifest(manifest_path, output_rows)
     _write_json(
         metadata_path,
@@ -232,7 +288,98 @@ def register_slices_to_atlas(
         warped_sections_dir=warped_sections_dir,
         overlay_dir=overlay_dir,
         section_indices=section_indices,
+        contact_sheet_path=contact_sheet_path,
+        mask_diagnostics_path=mask_diagnostics_path,
+        mask_diagnostics_sheet_path=mask_diagnostics_sheet_path,
     )
+
+
+def _overlay_thumbnail(overlay: np.ndarray, *, max_size: tuple[int, int] = (320, 240)) -> np.ndarray:
+    image = Image.fromarray(overlay, mode="RGB")
+    thumbnail = ImageOps.contain(image, max_size, method=Image.Resampling.LANCZOS)
+    return np.asarray(thumbnail)
+
+
+def _write_overlay_contact_sheet(overlays: list[tuple[int, np.ndarray]], output_path: Path) -> None:
+    columns = 5
+    tile_width = 320
+    tile_height = 240
+    label_height = 28
+    padding = 12
+    rows = max(1, int(np.ceil(len(overlays) / columns)))
+    contact_sheet = Image.new(
+        "RGB",
+        (columns * (tile_width + padding) + padding, rows * (tile_height + label_height + padding) + padding),
+        color=(28, 28, 28),
+    )
+    draw = ImageDraw.Draw(contact_sheet)
+    for ordinal, (section_index, overlay) in enumerate(overlays):
+        column = ordinal % columns
+        row = ordinal // columns
+        x0 = padding + column * (tile_width + padding)
+        y0 = padding + row * (tile_height + label_height + padding)
+        thumbnail = Image.fromarray(overlay, mode="RGB")
+        image_x = x0 + (tile_width - thumbnail.width) // 2
+        image_y = y0 + label_height + (tile_height - thumbnail.height) // 2
+        draw.text((x0, y0 + 5), str(section_index), fill=(255, 255, 0))
+        contact_sheet.paste(thumbnail, (image_x, image_y))
+    contact_sheet.save(output_path)
+
+
+def _mask_comparison_metrics(section_mask: np.ndarray, atlas_mask: np.ndarray) -> dict[str, float]:
+    section = np.asarray(section_mask, dtype=bool)
+    atlas = np.asarray(atlas_mask, dtype=bool)
+    section_area = float(section.sum())
+    atlas_area = float(atlas.sum())
+    intersection = float(np.logical_and(section, atlas).sum())
+    dice, iou = _overlap_metrics(section, atlas)
+    return {
+        "dice": float(dice),
+        "iou": float(iou),
+        "area_ratio": section_area / max(1.0, atlas_area),
+        "inside_fraction": intersection / max(1.0, section_area),
+    }
+
+
+def _mask_comparison_thumbnail(
+    warped_section: np.ndarray,
+    atlas_mask: np.ndarray,
+    section_mask: np.ndarray,
+) -> np.ndarray:
+    gray = _normalize_uint8(warped_section)
+    overlay = np.repeat(gray[..., None], 3, axis=-1)
+    mask = np.asarray(section_mask, dtype=bool)
+    overlay[mask] = (
+        0.45 * overlay[mask].astype(np.float32) + 0.55 * np.asarray((255, 70, 70), dtype=np.float32)
+    ).astype(np.uint8)
+    overlay[_boundary_mask(atlas_mask)] = (0, 255, 0)
+    return _overlay_thumbnail(overlay, max_size=(240, 240))
+
+
+def _write_mask_diagnostic_sheet(
+    comparisons: list[tuple[int, np.ndarray, np.ndarray, float, float]],
+    output_path: Path,
+) -> None:
+    tile_width = 240
+    tile_height = 240
+    label_height = 28
+    padding = 12
+    sheet = Image.new(
+        "RGB",
+        (2 * (tile_width + padding) + padding, max(1, len(comparisons)) * (tile_height + label_height + padding) + padding),
+        color=(28, 28, 28),
+    )
+    draw = ImageDraw.Draw(sheet)
+    for row, (section_index, bright, envelope, bright_dice, envelope_dice) in enumerate(comparisons):
+        y0 = padding + row * (tile_height + label_height + padding)
+        for column, (name, thumbnail, dice) in enumerate(
+            (("Bright", bright, bright_dice), ("Envelope", envelope, envelope_dice))
+        ):
+            x0 = padding + column * (tile_width + padding)
+            draw.text((x0, y0 + 5), f"{section_index} {name}  Dice {dice:.3f}", fill=(255, 255, 255))
+            image = Image.fromarray(thumbnail, mode="RGB")
+            sheet.paste(image, (x0 + (tile_width - image.width) // 2, y0 + label_height + (tile_height - image.height) // 2))
+    sheet.save(output_path)
 
 
 def _register_section_to_atlas(
@@ -255,18 +402,23 @@ def _prepare_section_registration_input(
     section_image: np.ndarray,
     config: SliceRegistrationConfig,
 ) -> _PreparedSectionRegistrationInput | None:
-    section_mask = _tissue_mask(section_image, quantile=config.tissue_threshold_quantile)
-    section_bbox = _bbox(section_mask)
+    bright_mask = _tissue_mask(section_image, quantile=config.tissue_threshold_quantile)
+    section_bbox = _bbox(bright_mask)
     if section_bbox is None:
         return None
 
     section_crop = section_image[section_bbox[0] : section_bbox[1], section_bbox[2] : section_bbox[3]].astype(np.float32)
-    section_mask_crop = section_mask[section_bbox[0] : section_bbox[1], section_bbox[2] : section_bbox[3]]
+    bright_mask_crop = bright_mask[section_bbox[0] : section_bbox[1], section_bbox[2] : section_bbox[3]]
+    boundary_mask_crop = _boundary_fit_mask(section_crop, config)
+    envelope_mask_crop = boundary_mask_crop if np.any(boundary_mask_crop) else bright_mask_crop
+    section_mask_crop = bright_mask_crop if config.tissue_mask_mode == "bright" else envelope_mask_crop
     return _PreparedSectionRegistrationInput(
         section_crop=section_crop,
         section_mask_crop=section_mask_crop,
         section_display_mask_crop=_display_tissue_mask(section_crop, config),
-        section_boundary_mask_crop=_boundary_fit_mask(section_crop, config),
+        section_boundary_mask_crop=boundary_mask_crop,
+        section_bright_mask_crop=bright_mask_crop,
+        section_envelope_mask_crop=envelope_mask_crop,
     )
 
 
@@ -322,6 +474,21 @@ def _register_prepared_section_to_atlas(
         _warp_image(section_boundary_mask_crop.astype(np.float32), transform_matrix, atlas_shape, order=0, fill_value=0.0)
         >= 0.5
     )
+    diagnostic_masks = None
+    if config.save_mask_diagnostics:
+        other_mask = (
+            prepared_section.section_bright_mask_crop
+            if config.tissue_mask_mode == "envelope"
+            else prepared_section.section_envelope_mask_crop
+        )
+        other_warped_mask = (
+            _warp_image(other_mask.astype(np.float32), transform_matrix, atlas_shape, order=1, fill_value=0.0) >= 0.5
+        )
+        diagnostic_masks = (
+            (other_warped_mask, affine_warped_mask)
+            if config.tissue_mask_mode == "envelope"
+            else (affine_warped_mask, other_warped_mask)
+        )
     affine_boundary_metrics = _boundary_fit_metrics(affine_warped_boundary_mask, atlas_mask)
     affine_boundary_distance = _boundary_distance_metric_value(affine_warped_boundary_mask, atlas_mask)
 
@@ -360,6 +527,7 @@ def _register_prepared_section_to_atlas(
         **affine_metadata,
         "matrix": transform_matrix.tolist(),
         "_warped_mask": warped_mask,
+        "_diagnostic_masks": diagnostic_masks,
         "_warped_display_mask": warped_display_mask,
         "_warped_boundary_mask": warped_boundary_mask,
         "_affine_warped_section": affine_warped_section if config.nonlinear_refinement_model != "none" else None,

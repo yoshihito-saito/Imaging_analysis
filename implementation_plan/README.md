@@ -1,5 +1,12 @@
 # Implementation Plans
 
+- [2026-10-02 Registration Tissue Envelope and Mask Comparison](2026-10-02-registration-envelope-mask.md)
+- [2026-10-02 Waxholm AP Millimetres for Slice-Atlas Pairing](2026-10-02-whs-ap-plane-input.md)
+- [2026-09-30 ROI-Based ND2 Export](2026-09-30-roi-nd2-export.md)
+- [2026-09-28 Two-Pass Section Detection](2026-09-28-two-pass-section-detection.md)
+- [2026-09-28 Output Surface Reduction](2026-09-28-output-surface-reduction.md)
+- [2026-09-28 Export Throughput Improvements](2026-09-28-export-throughput.md)
+- [2026-09-25 Export Section Review Outputs](2026-09-25-export-section-review.md)
 - [2026-06-14 ND2 Brain Section Pipeline](2026-06-14-nd2-brain-section-pipeline.md)
 - [2026-07-08 BrainGlobe Atlas Preparation](2026-07-08-brainglobe-atlas-preparation.md)
 - [2026-07-13 Environment Stabilization](2026-07-13-environment-stabilization.md)

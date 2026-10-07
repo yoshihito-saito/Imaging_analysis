@@ -151,6 +151,111 @@ def read_nd2_image(
     )
 
 
+class Nd2RegionReader:
+    """Read bounded single-channel regions while keeping one ND2 handle open."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        scene_index: int = 0,
+        position_index: int | None = None,
+        time_index: int = 0,
+        z_index: int | None = None,
+        z_projection: str = "max",
+    ) -> None:
+        self.path = Path(path)
+        self.scene_index = scene_index
+        self.position_index = position_index
+        self.time_index = time_index
+        self.z_index = z_index
+        self.z_projection = z_projection
+        self._handle: Any = None
+        self._array: Any = None
+        self.dims: tuple[str, ...] = ()
+        self.sizes: dict[str, int] = {}
+        self.metadata: dict[str, Any] = {}
+
+    def __enter__(self) -> Nd2RegionReader:
+        self._handle = _import_nd2().ND2File(self.path)
+        try:
+            self.sizes = dict(getattr(self._handle, "sizes", {}))
+            self._array = self._handle.to_dask()
+            self.dims = tuple(str(dim).upper() for dim in self.sizes)
+            if len(self.dims) != self._array.ndim:
+                self.dims = _guess_dims(np.empty(self._array.shape))
+            self.metadata = {
+                "sizes": self.sizes,
+                "channels": _channel_metadata(self._handle),
+                "voxel_size_um": _voxel_size_metadata(self._handle),
+                "source_dims": self.dims,
+                "scene_index": self.scene_index,
+                "position_index": self.position_index,
+                "time_index": self.time_index,
+                "z_index": self.z_index,
+                "z_projection": self.z_projection,
+                "downsample": 1,
+            }
+            return self
+        except Exception:
+            self._handle.close()
+            self._handle = None
+            raise
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        if self._handle is not None:
+            self._handle.close()
+        self._handle = None
+        self._array = None
+
+    @property
+    def image_shape(self) -> tuple[int, int]:
+        return (int(self._array.shape[self.dims.index("Y")]), int(self._array.shape[self.dims.index("X")]))
+
+    @property
+    def channel_count(self) -> int:
+        return int(self._array.shape[self.dims.index("C")]) if "C" in self.dims else 1
+
+    def read_region(self, y0: int, y1: int, x0: int, x1: int, *, channel: int) -> np.ndarray:
+        """Return one projected channel as a full-resolution 2D array."""
+
+        if self._array is None:
+            raise RuntimeError("ND2 region reader is not open.")
+        height, width = self.image_shape
+        if not (0 <= y0 < y1 <= height and 0 <= x0 < x1 <= width):
+            raise ValueError("Region bounds must lie within the ND2 image.")
+        if not 0 <= channel < self.channel_count:
+            raise ValueError(f"Channel {channel} is outside the available range.")
+
+        selectors: list[int | slice] = []
+        remaining_dims: list[str] = []
+        for dim in self.dims:
+            if dim == "Y":
+                selector: int | slice = slice(y0, y1)
+            elif dim == "X":
+                selector = slice(x0, x1)
+            elif dim == "C":
+                selector = channel
+            elif dim in {"S", "SCENE"}:
+                selector = self.scene_index
+            elif dim in {"P", "POSITION"}:
+                selector = 0 if self.position_index is None else self.position_index
+            elif dim in {"T", "TIME"}:
+                selector = self.time_index
+            elif dim == "Z" and self.z_index is not None:
+                selector = self.z_index
+            else:
+                selector = slice(None) if dim == "Z" else 0
+            selectors.append(selector)
+            if isinstance(selector, slice):
+                remaining_dims.append(dim)
+
+        array = np.asarray(self._array[tuple(selectors)].compute())
+        array, dims = _project_or_select_z(array, tuple(remaining_dims), self.z_index, self.z_projection)
+        array = np.moveaxis(array, (dims.index("Y"), dims.index("X")), (0, 1))
+        return np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def _import_nd2():
     try:
         import nd2  # type: ignore[import-not-found]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -14,6 +15,10 @@ from tifffile import imread, imwrite
 
 SectionSource = Literal["registration", "rgb", "channel"]
 AxisName = Literal["ap", "si", "dv", "rl", "ml"]
+
+_WHS_SOURCE_AP_ORIGIN_VOXEL = 623
+_WHS_SOURCE_VOXEL_SIZE_MM = 0.0390625
+_WHS_AP_AXIS_LENGTH = 1024
 
 
 @dataclass(frozen=True)
@@ -29,6 +34,7 @@ class SliceAtlasConfig:
     sample_id: str | None = None
     allowed_qc_statuses: tuple[str, ...] | None = None
     require_include_in_stack: bool = True
+    copy_section_source: bool = False
     output_name: str = "slice_atlas_manifest.csv"
     metadata_name: str = "slice_atlas_metadata.json"
 
@@ -42,7 +48,7 @@ class SliceAtlasResult:
     metadata_path: Path
     atlas_reference_dir: Path
     atlas_annotation_dir: Path
-    section_source_dir: Path
+    section_source_dir: Path | None
     section_indices: list[int]
 
 
@@ -52,7 +58,7 @@ def prepare_slice_atlas_inputs(
     *,
     config: SliceAtlasConfig | None = None,
 ) -> SliceAtlasResult:
-    """Export atlas planes per section for sparse slice-wise workflows."""
+    """Export atlas planes, accepting WHS-native AP millimetres on selected rows."""
 
     cfg = config or SliceAtlasConfig()
     manifest = Path(manifest_path)
@@ -65,40 +71,61 @@ def prepare_slice_atlas_inputs(
     atlas_annotation = np.asarray(atlas.annotation)
     atlas_orientation = str(getattr(atlas, "orientation", "")).lower()
     atlas_resolution = list(getattr(atlas, "resolution", []))
+    atlas_version = str(getattr(atlas, "metadata", {}).get("version", ""))
     slice_axis = _axis_index_from_orientation(atlas_orientation, cfg.anatomical_axis)
+
+    assignments = [
+        _slice_assignment_for_row(
+            row,
+            ordinal,
+            cfg,
+            atlas_reference.shape,
+            atlas_orientation,
+            atlas_resolution,
+            atlas_version,
+            slice_axis,
+        )
+        for ordinal, row in enumerate(rows)
+    ]
 
     target_dir = Path(output_dir) if output_dir is not None else manifest.parent / "slice_atlas"
     atlas_reference_dir = target_dir / "atlas_reference"
     atlas_annotation_dir = target_dir / "atlas_annotation"
-    section_source_dir = target_dir / "sections"
+    section_source_dir = target_dir / "sections" if cfg.copy_section_source else None
     atlas_reference_dir.mkdir(parents=True, exist_ok=True)
     atlas_annotation_dir.mkdir(parents=True, exist_ok=True)
-    section_source_dir.mkdir(parents=True, exist_ok=True)
+    if section_source_dir is not None:
+        section_source_dir.mkdir(parents=True, exist_ok=True)
 
     pairing_rows: list[dict[str, Any]] = []
     selected_indices: list[int] = []
-    for ordinal, row in enumerate(rows):
+    for row, (atlas_slice_index, atlas_plane_whs_ap_mm) in zip(rows, assignments):
         section_index = int(row["section_index"])
-        atlas_slice_index = _slice_index_for_row(row, ordinal, cfg, atlas_reference.shape[slice_axis])
         reference_slice = _extract_slice(atlas_reference, slice_axis, atlas_slice_index)
         annotation_slice = _extract_slice(atlas_annotation, slice_axis, atlas_slice_index)
         section_path = _section_source_path(row, cfg)
 
         reference_path = atlas_reference_dir / f"section{section_index:03d}_atlas_reference.tif"
         annotation_path = atlas_annotation_dir / f"section{section_index:03d}_atlas_annotation.tif"
-        section_copy_path = section_source_dir / f"section{section_index:03d}_section.tif"
+        section_copy_path = (
+            section_source_dir / f"section{section_index:03d}_section.tif" if section_source_dir is not None else section_path
+        )
         imwrite(reference_path, reference_slice)
         imwrite(annotation_path, annotation_slice)
-        _copy_section_image(section_path, section_copy_path)
+        if section_source_dir is not None:
+            _copy_section_image(section_path, section_copy_path)
 
         pairing_rows.append(
             {
                 **row,
                 "atlas_name": cfg.atlas_name,
+                "atlas_version": atlas_version,
                 "atlas_orientation": atlas_orientation,
                 "atlas_axis_name": cfg.anatomical_axis,
                 "atlas_axis_index": slice_axis,
                 "atlas_slice_index": atlas_slice_index,
+                "whs_ap_mm": row.get("whs_ap_mm", ""),
+                "atlas_plane_whs_ap_mm": atlas_plane_whs_ap_mm if atlas_plane_whs_ap_mm is not None else "",
                 "atlas_reference_path": str(reference_path),
                 "atlas_annotation_path": str(annotation_path),
                 "section_source_kind": cfg.section_source,
@@ -115,6 +142,7 @@ def prepare_slice_atlas_inputs(
         {
             "input_manifest_path": str(manifest),
             "atlas_name": cfg.atlas_name,
+            "atlas_version": atlas_version,
             "atlas_orientation": atlas_orientation,
             "atlas_resolution_um": atlas_resolution,
             "atlas_shape": list(atlas_reference.shape),
@@ -122,6 +150,18 @@ def prepare_slice_atlas_inputs(
             "slice_axis_name": cfg.anatomical_axis,
             "section_indices": selected_indices,
             "config": asdict(cfg),
+            **(
+                {
+                    "whs_ap_calibration": {
+                        "source": "WHS_SD_rat_T2star_v1.01",
+                        "source_ap_origin_voxel": _WHS_SOURCE_AP_ORIGIN_VOXEL,
+                        "source_voxel_size_mm": _WHS_SOURCE_VOXEL_SIZE_MM,
+                        "rounding": "nearest_voxel",
+                    }
+                }
+                if any(plane_mm is not None for _, plane_mm in assignments)
+                else {}
+            ),
         },
     )
 
@@ -177,20 +217,69 @@ def _axis_index_from_orientation(orientation: str, axis_name: AxisName) -> int:
     raise ValueError(f"Could not find anatomical axis {axis_name!r} in atlas orientation {orientation!r}.")
 
 
-def _slice_index_for_row(
+def _slice_assignment_for_row(
     row: dict[str, str],
     ordinal: int,
     cfg: SliceAtlasConfig,
-    axis_length: int,
-) -> int:
+    atlas_shape: tuple[int, ...],
+    atlas_orientation: str,
+    atlas_resolution: list[float],
+    atlas_version: str,
+    axis: int,
+) -> tuple[int, float | None]:
+    axis_length = atlas_shape[axis]
     explicit_value = row.get("atlas_slice_index")
+    whs_ap_value = row.get("whs_ap_mm")
+    if whs_ap_value is not None and whs_ap_value.strip():
+        if explicit_value is not None and explicit_value.strip():
+            raise ValueError(
+                f"Section {row['section_index']} has both whs_ap_mm and atlas_slice_index; specify only one."
+            )
+        _validate_whs_ap_atlas(cfg, atlas_shape, atlas_orientation, atlas_resolution, atlas_version, axis)
+        try:
+            requested_ap_mm = float(whs_ap_value)
+        except ValueError as exc:
+            raise ValueError(f"Section {row['section_index']} has invalid whs_ap_mm={whs_ap_value!r}.") from exc
+        if not math.isfinite(requested_ap_mm):
+            raise ValueError(f"Section {row['section_index']} requires a finite whs_ap_mm.")
+        source_voxel = _WHS_SOURCE_AP_ORIGIN_VOXEL + requested_ap_mm / _WHS_SOURCE_VOXEL_SIZE_MM
+        # BrainGlobe's ASR array reverses the source volume's posterior-origin AP axis.
+        continuous_index = axis_length - 1 - source_voxel
+        if not 0 <= continuous_index <= axis_length - 1:
+            raise ValueError(f"Section {row['section_index']} WHS AP coordinate is outside the atlas AP range.")
+        index = round(continuous_index)
+        selected_source_voxel = axis_length - 1 - index
+        selected_ap_mm = (selected_source_voxel - _WHS_SOURCE_AP_ORIGIN_VOXEL) * _WHS_SOURCE_VOXEL_SIZE_MM
+        return index, selected_ap_mm
     if explicit_value is not None and explicit_value.strip():
         index = int(explicit_value)
     else:
         index = cfg.start_slice_index + ordinal * cfg.slice_index_step
     if index < 0 or index >= axis_length:
         raise ValueError(f"Atlas slice index {index} is outside the available range 0..{axis_length - 1}.")
-    return index
+    return index, None
+
+
+def _validate_whs_ap_atlas(
+    cfg: SliceAtlasConfig,
+    atlas_shape: tuple[int, ...],
+    atlas_orientation: str,
+    atlas_resolution: list[float],
+    atlas_version: str,
+    axis: int,
+) -> None:
+    if cfg.atlas_name != "whs_sd_rat_39um" or cfg.anatomical_axis != "ap":
+        raise ValueError("whs_ap_mm requires the AP axis of the whs_sd_rat_39um atlas.")
+    if (
+        atlas_version != "3.0"
+        or atlas_orientation != "asr"
+        or tuple(atlas_shape) != (_WHS_AP_AXIS_LENGTH, 512, 512)
+        or axis != 0
+        or len(atlas_resolution) != 3
+        or not math.isfinite(float(atlas_resolution[axis]))
+        or abs(float(atlas_resolution[axis]) - 39.0) > 0.5
+    ):
+        raise ValueError("whs_ap_mm requires the validated BrainGlobe v3.0 WHS rat atlas (asr, 1024 AP planes, 39 um).")
 
 
 def _extract_slice(volume: np.ndarray, axis: int, index: int) -> np.ndarray:

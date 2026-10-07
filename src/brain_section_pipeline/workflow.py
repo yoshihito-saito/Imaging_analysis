@@ -37,7 +37,7 @@ def run_slicewise_atlas_workflow(
     qc_config: SliceAtlasQcConfig | None = None,
     registration_config: SliceRegistrationConfig | None = None,
     atlas_summary_config: AtlasSummaryConfig | None = None,
-    generate_qc: bool = True,
+    generate_qc: bool = False,
     generate_summary: bool = True,
 ) -> SliceWorkflowResult:
     """Run export, atlas pairing, optional QC, registration, and optional summary."""

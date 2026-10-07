@@ -10,7 +10,11 @@ from brain_section_pipeline import SliceAtlasConfig, prepare_slice_atlas_inputs
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("manifest", type=Path, help="Path to section_manifest.csv")
+    parser.add_argument(
+        "manifest",
+        type=Path,
+        help="Path to section_manifest.csv; selected rows may specify whs_ap_mm instead of atlas_slice_index.",
+    )
     parser.add_argument("--output-dir", type=Path, default=None, help="Directory for exported atlas planes and pairing metadata.")
     parser.add_argument("--atlas", default="whs_sd_rat_39um", help="BrainGlobe atlas name.")
     parser.add_argument(
@@ -26,6 +30,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-id", default=None, help="Optional sample_id filter.")
     parser.add_argument("--qc-status", dest="qc_statuses", action="append", default=None, help="Allowed QC status. Repeat to allow multiple.")
     parser.add_argument("--ignore-include-flag", action="store_true", help="Include sections even when include_in_stack is false.")
+    parser.add_argument(
+        "--copy-section-source",
+        action="store_true",
+        help="Copy selected section images into slice_atlas/sections instead of referencing their existing paths.",
+    )
     return parser.parse_args()
 
 
@@ -41,6 +50,7 @@ def main() -> None:
         sample_id=args.sample_id,
         allowed_qc_statuses=tuple(args.qc_statuses) if args.qc_statuses is not None else None,
         require_include_in_stack=not args.ignore_include_flag,
+        copy_section_source=args.copy_section_source,
     )
     result = prepare_slice_atlas_inputs(args.manifest, args.output_dir, config=config)
     print(f"Slice-atlas output directory: {result.output_dir}")
