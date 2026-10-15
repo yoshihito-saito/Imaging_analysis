@@ -864,9 +864,10 @@ This stage writes:
 
 Registration now fits and scores a fuller tissue-envelope mask by default.
 The envelope uses the existing lower-threshold boundary mask, with small-gap
-closing and speck removal. The bright 0.8-quantile mask still defines the
-source crop, so crop coordinates remain comparable with earlier runs. The
-display mask remains separate. Set `tissue_mask_mode="bright"` (or pass
+closing and speck removal. Source crops now cover the union of the bright,
+lower-threshold boundary, and display masks, plus eight source pixels of
+padding. This preserves dim peripheral tissue before fitting. The crop origin
+is recorded, and the display mask remains separate. Set `tissue_mask_mode="bright"` (or pass
 `--tissue-mask-mode bright`) to retain the earlier fitting/scoring mask.
 `boundary_fit_threshold_quantile` controls the envelope threshold; the
 default is 0.35.
@@ -875,7 +876,8 @@ For a mask comparison at the *same* fitted transform, set
 `save_mask_diagnostics=True` (or pass `--save-mask-diagnostics`). This adds one
 CSV with bright/envelope Dice, area ratio, and inside fraction, plus one
 two-column mask contact sheet. It is off by default for large batches, and
-currently requires nonlinear refinement to be disabled. A higher Dice from
+currently requires `nonlinear_refinement_model="none"` (or
+`--nonlinear-refinement-model none`). A higher Dice from
 a fuller mask does not alone demonstrate better anatomical alignment; review
 the red mask against the tissue and the green atlas outline in the sheet.
 
@@ -884,9 +886,9 @@ retain every full-resolution overlay. The default low-quality cutoff is Dice
 `0.80`; tune it with `low_quality_dice_threshold` or
 `--low-quality-dice-threshold`.
 
-The default transform model is slice-wise similarity registration
-(scale/rotation/translation) against the selected 2D atlas plane, with an
-optional constrained affine refinement. That makes it a real reusable
+The default transform model is slice-wise constrained affine registration,
+initialized by similarity fitting (scale/rotation/translation), followed by
+multiresolution intensity refinement. That makes it a real reusable
 section-to-atlas alignment stage for sparse workflows, but it is still
 intentionally separate from 3D reconstruction. The default registration now
 initializes scale from the section and atlas mask bounding boxes, keeps rotation
@@ -894,6 +896,80 @@ fixed at neutral orientation unless you opt into a rotation search, and
 penalizes substantial warped-mask size and center mismatches. This makes the
 final overlays less likely to look oversized, off-center, or spuriously rotated
 for large slide-derived crops.
+
+The intensity stage optimizes normalized mutual information between the
+structural channel and the atlas reference, retaining the existing mask and
+affine penalties. Its Gaussian-smoothed partial-volume intensity histogram does not require
+histology and MRI to have the same brightness or contrast. It uses at most
+4,096 tissue samples, work images with maximum dimensions 96, 192, and 384,
+and 180 objective evaluations per level. Source images are reduced according
+to the section-to-atlas scale. Only improvements in both internal agreement
+and the combined objective are accepted; constant or insufficiently variable
+reference/section images retain the mask fit. Existing scale, rotation,
+translation, anisotropy, and shear bounds also constrain this stage.
+Set `intensity_refinement=False` or pass `--skip-intensity-refinement` to skip
+it. Atlas-index candidate searches keep their inexpensive mask scoring.
+
+For residual internal distortion, the optional 2D cubic B-spline stage is enabled
+by default. To disable it and keep the global affine result:
+
+```powershell
+python scripts\register_slices_to_atlas.py outputs\rat_01\slice_atlas\slice_atlas_manifest.csv --nonlinear-refinement-model none
+```
+
+The same controls are available in `scripts/run_slicewise_workflow.py` and
+`SliceRegistrationConfig`. In Python, disable B-splines with
+`SliceRegistrationConfig(nonlinear_refinement_model="none")`. Their default
+control-point spacing is 1,500 um, maximum displacement is 200 um, bending
+weight is 0.1, and optimizer budget is 40 iterations. These are conservative
+starting settings for review, not empirically validated settings for every
+stain or anatomy. `--bspline-control-point-spacing-um`,
+`--bspline-max-displacement-um`, `--bspline-bending-weight`, and
+`--bspline-max-iterations` control the cost and flexibility. Both displacement
+components are bounded so their interpolated physical vector magnitude cannot
+exceed the displacement limit. Fields must improve image agreement and the
+combined objective and have a full-grid pullback Jacobian determinant of at
+least 0.2 (`--bspline-min-jacobian`), or the affine result is retained.
+
+New atlas-pairing and index-selection manifests include the atlas-plane Y/X
+pixel sizes. With an older manifest, supply the actual atlas-plane spacing,
+for example `--atlas-pixel-size-um 39 39` for the BrainGlobe WHS 39 um atlas.
+The Python equivalent is `atlas_pixel_size_um=(39.0, 39.0)`. Distances are
+converted to atlas pixels independently for each axis; source ND2 pixel sizes
+must not be used here. Plane identity and cutting angle still need to be
+established before deformation. Mutual information can also favor incorrect
+correspondences, so review internal structures as well as the outline.
+
+The registration manifest and JSON metadata report intensity agreement before
+and after refinement, evaluation/iteration counts, accepted/rejected or
+low-contrast status, and B-spline displacement and Jacobian measurements.
+Each section also gets a `transforms/sectionNNN_transform.npz` containing the
+source-to-atlas affine matrix, crop coordinates, output shape, and optional
+B-spline coefficients and pullback displacement. The affine `registration_loss`
+remains a mask-objective value; the intensity and B-spline metrics are reported
+separately. To apply an affine or new B-spline transform to another channel:
+
+```python
+from brain_section_pipeline import apply_slice_registration_transform
+
+warped_signal = apply_slice_registration_transform(
+    signal_section_image, registration_transform_path,
+)
+```
+
+The signal image must have the same dimensions and section-crop coordinates
+as the original registration source. The complete transformation samples the
+original signal once. Full-resolution ND2 images are not loaded for refinement.
+Legacy `boundary_spline` retains its boundary-only behavior and pixel-based
+controls; its deformation is not supported by the new replay helper.
+
+The numerical implementation is in `registration_refinement.py`:
+`_bspline_basis` constructs the local cubic control-point weights;
+`bspline_displacement` evaluates the smooth displacement field;
+`_bending_energy` penalizes curvature and provides its gradient;
+`refine_bspline_intensity` optimizes the control points against internal
+intensities and tissue coverage; and `displacement_jacobian` detects folded
+or excessively compressed sampling grids.
 
 Once those warped sections exist, the next reusable step is
 `summarize_registered_slices_by_region`.

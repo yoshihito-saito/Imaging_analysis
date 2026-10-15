@@ -123,6 +123,8 @@ def prepare_slice_atlas_inputs(
                 "atlas_orientation": atlas_orientation,
                 "atlas_axis_name": cfg.anatomical_axis,
                 "atlas_axis_index": slice_axis,
+                "atlas_pixel_size_y_um": float(atlas_resolution[[i for i in range(3) if i != slice_axis][0]]),
+                "atlas_pixel_size_x_um": float(atlas_resolution[[i for i in range(3) if i != slice_axis][1]]),
                 "atlas_slice_index": atlas_slice_index,
                 "whs_ap_mm": row.get("whs_ap_mm", ""),
                 "atlas_plane_whs_ap_mm": atlas_plane_whs_ap_mm if atlas_plane_whs_ap_mm is not None else "",

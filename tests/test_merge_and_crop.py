@@ -2153,7 +2153,7 @@ def test_register_slices_to_atlas_writes_warped_outputs_and_metrics(tmp_path):
 
     result = register_slices_to_atlas(
         manifest_path,
-        config=SliceRegistrationConfig(max_rotation_degrees=30.0, save_individual_overlays=True),
+        config=SliceRegistrationConfig(max_rotation_degrees=30.0, save_individual_overlays=True, nonlinear_refinement_model="none"),
     )
 
     with result.manifest_path.open("r", encoding="utf-8", newline="") as handle:
@@ -2175,7 +2175,7 @@ def test_register_slices_to_atlas_writes_warped_outputs_and_metrics(tmp_path):
     compact_result = register_slices_to_atlas(
         manifest_path,
         pairing_dir / "compact_registration",
-        config=SliceRegistrationConfig(max_rotation_degrees=30.0, low_quality_dice_threshold=0.0, save_mask_diagnostics=True),
+        config=SliceRegistrationConfig(max_rotation_degrees=30.0, low_quality_dice_threshold=0.0, save_mask_diagnostics=True, nonlinear_refinement_model="none"),
     )
     compact_rows = list(csv.DictReader(compact_result.manifest_path.open(encoding="utf-8", newline="")))
     assert compact_rows[0]["registration_overlay_path"] == ""
@@ -2429,6 +2429,7 @@ def test_slice_registration_affine_model_reports_bounded_affine_metadata():
     atlas_mask[12:50, 20:56] = True
     config = SliceRegistrationConfig(
         transform_model="affine",
+        nonlinear_refinement_model="none",
         tissue_threshold_quantile=0.5,
         max_rotation_degrees=0.0,
         min_scale_factor=0.9,
@@ -2531,7 +2532,7 @@ def test_register_slices_to_atlas_handles_empty_masks(tmp_path):
         writer.writeheader()
         writer.writerows(rows)
 
-    result = register_slices_to_atlas(manifest_path, config=SliceRegistrationConfig(save_mask_diagnostics=True))
+    result = register_slices_to_atlas(manifest_path, config=SliceRegistrationConfig(save_mask_diagnostics=True, nonlinear_refinement_model="none"))
 
     metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
     assert metadata["rows"][0]["registration_status"] == "empty_mask"

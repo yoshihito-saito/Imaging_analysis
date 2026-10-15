@@ -15,7 +15,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pairing_manifest", type=Path, help="Path to the slice_atlas pairing manifest.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Directory for warped sections and registration overlays.")
-    parser.add_argument("--tissue-threshold-quantile", type=float, default=0.8, help="Quantile used for the bright mask and stable source crop.")
+    parser.add_argument("--tissue-threshold-quantile", type=float, default=0.8, help="Quantile used for the bright tissue mask.")
+    parser.add_argument("--crop-padding-px", type=int, default=8, help="Padding around the union of permissive tissue masks in source pixels.")
+    parser.add_argument("--skip-intensity-refinement", action="store_true", help="Skip the multiresolution mutual-information global refinement.")
+    parser.add_argument("--intensity-weight", type=float, default=1.0)
+    parser.add_argument("--intensity-pyramid-max-dims", type=int, nargs="+", default=(96, 192, 384))
+    parser.add_argument("--intensity-max-samples", type=int, default=4096)
+    parser.add_argument("--intensity-histogram-bins", type=int, default=32)
+    parser.add_argument("--intensity-max-evaluations", type=int, default=180, help="Objective evaluation budget per affine pyramid level.")
     parser.add_argument(
         "--tissue-mask-mode",
         choices=("envelope", "bright"),
@@ -34,7 +41,7 @@ def main() -> None:
     parser.add_argument(
         "--transform-model",
         choices=("similarity", "affine"),
-        default="similarity",
+        default="affine",
         help="Final transform model. affine adds constrained anisotropic scale and shear refinement after similarity fitting.",
     )
     parser.add_argument(
@@ -124,10 +131,17 @@ def main() -> None:
     )
     parser.add_argument(
         "--nonlinear-refinement-model",
-        choices=("none", "boundary_spline"),
-        default="none",
-        help="Optional local boundary refinement after the global similarity/affine fit.",
+        choices=("none", "boundary_spline", "bspline"),
+        default="bspline",
+        help="bspline (default) optimizes internal image agreement; none disables local refinement; boundary_spline retains the legacy outline refinement.",
     )
+    parser.add_argument("--atlas-pixel-size-um", type=float, nargs=2, metavar=("Y", "X"), default=None,
+                        help="Atlas plane pixel size; overrides metadata and is required for B-splines on older manifests.")
+    parser.add_argument("--bspline-max-displacement-um", type=float, default=200.0)
+    parser.add_argument("--bspline-control-point-spacing-um", type=float, default=1500.0)
+    parser.add_argument("--bspline-bending-weight", type=float, default=0.1)
+    parser.add_argument("--bspline-max-iterations", type=int, default=40)
+    parser.add_argument("--bspline-min-jacobian", type=float, default=0.2)
     parser.add_argument(
         "--nonlinear-max-displacement-px",
         type=float,
@@ -162,6 +176,19 @@ def main() -> None:
     args = parser.parse_args()
 
     config = SliceRegistrationConfig(
+        crop_padding_px=args.crop_padding_px,
+        intensity_refinement=not args.skip_intensity_refinement,
+        intensity_weight=args.intensity_weight,
+        intensity_pyramid_max_dims=tuple(args.intensity_pyramid_max_dims),
+        intensity_max_samples=args.intensity_max_samples,
+        intensity_histogram_bins=args.intensity_histogram_bins,
+        intensity_max_evaluations=args.intensity_max_evaluations,
+        atlas_pixel_size_um=tuple(args.atlas_pixel_size_um) if args.atlas_pixel_size_um else None,
+        bspline_max_displacement_um=args.bspline_max_displacement_um,
+        bspline_control_point_spacing_um=args.bspline_control_point_spacing_um,
+        bspline_bending_weight=args.bspline_bending_weight,
+        bspline_max_iterations=args.bspline_max_iterations,
+        bspline_min_jacobian=args.bspline_min_jacobian,
         tissue_threshold_quantile=args.tissue_threshold_quantile,
         tissue_mask_mode=args.tissue_mask_mode,
         save_mask_diagnostics=args.save_mask_diagnostics,
