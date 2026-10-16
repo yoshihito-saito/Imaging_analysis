@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -74,7 +74,7 @@ class AtlasIndexSuggestionConfig:
     atlas_plane_angle_search: bool = False
     atlas_plane_pitch_degrees: tuple[float, ...] = (0.0,)
     atlas_plane_yaw_degrees: tuple[float, ...] = (0.0,)
-    registration_config: SliceRegistrationConfig = field(default_factory=SliceRegistrationConfig)
+    registration_config: SliceRegistrationConfig = field(default_factory=lambda: SliceRegistrationConfig(transform_model="similarity", intensity_refinement=False, nonlinear_refinement_model="none"))
     output_name: str = "atlas_index_suggestions"
     candidate_manifest_name: str = "atlas_index_candidates.csv"
     selected_manifest_name: str = "selected_slice_atlas_manifest.csv"
@@ -334,6 +334,8 @@ def suggest_atlas_indices(
                 "atlas_orientation": atlas_orientation,
                 "atlas_axis_name": cfg.anatomical_axis,
                 "atlas_axis_index": slice_axis,
+                "atlas_pixel_size_y_um": float(atlas_resolution[[i for i in range(3) if i != slice_axis][0]]),
+                "atlas_pixel_size_x_um": float(atlas_resolution[[i for i in range(3) if i != slice_axis][1]]),
                 "ap_coordinate_system": cfg.ap_coordinate_system,
                 "ap_coordinate_offset_mm": cfg.ap_coordinate_offset_mm,
                 "atlas_slice_index": selected_index,
@@ -1154,6 +1156,8 @@ def _rank_candidate_indices(
     atlas_plane_angles: list[tuple[float, float]],
 ) -> list[dict[str, Any]]:
     ranked = []
+    if registration_config.nonlinear_refinement_model == "bspline":
+        registration_config = replace(registration_config, nonlinear_refinement_model="none")
     for atlas_slice_index in candidate_indices:
         atlas_ap_mm = atlas_index_to_ap_mm(
             atlas_slice_index,
@@ -1201,6 +1205,7 @@ def _rank_candidate_indices(
                 atlas_reference=reference_slice,
                 atlas_mask=atlas_mask,
                 config=registration_config,
+                refine_intensity=False,
             )
             registration.update(_anatomical_alignment_metrics(registration, atlas_mask))
             overlay = _compose_overlay(

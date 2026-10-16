@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
@@ -14,10 +14,12 @@ from PIL import Image, ImageDraw, ImageOps
 from scipy import ndimage
 from tifffile import imread, imwrite
 
+from .registration_refinement import _compose_affines, _inverse_affine, refine_affine_intensity, refine_bspline_intensity
+
 ScaleInitialization = Literal["bbox_fit", "area"]
 TranslationInitialization = Literal["crop_center", "tissue_centroid"]
 TransformModel = Literal["similarity", "affine"]
-NonlinearRefinementModel = Literal["none", "boundary_spline"]
+NonlinearRefinementModel = Literal["none", "boundary_spline", "bspline"]
 TissueMaskMode = Literal["bright", "envelope"]
 
 
@@ -35,7 +37,7 @@ class SliceRegistrationConfig:
     min_scale_factor: float = 0.8
     max_scale_factor: float = 1.0
     translation_search_fraction: float = 0.25
-    transform_model: TransformModel = "similarity"
+    transform_model: TransformModel = "affine"
     initial_rotation_degrees: float | None = 0.0
     scale_initialization: ScaleInitialization = "bbox_fit"
     translation_initialization: TranslationInitialization = "tissue_centroid"
@@ -52,7 +54,7 @@ class SliceRegistrationConfig:
     boundary_fit_dilation_px: int = 0
     boundary_fit_weight: float = 0.35
     boundary_containment_weight: float = 1.2
-    nonlinear_refinement_model: NonlinearRefinementModel = "none"
+    nonlinear_refinement_model: NonlinearRefinementModel = "bspline"
     nonlinear_max_displacement_px: float = 8.0
     nonlinear_control_point_spacing_px: float = 48.0
     nonlinear_iterations: int = 2
@@ -64,6 +66,19 @@ class SliceRegistrationConfig:
     metadata_name: str = "slice_registration_metadata.json"
     tissue_mask_mode: TissueMaskMode = "envelope"
     save_mask_diagnostics: bool = False
+    crop_padding_px: int = 8
+    intensity_refinement: bool = True
+    intensity_weight: float = 1.0
+    intensity_pyramid_max_dims: tuple[int, ...] = (96, 192, 384)
+    intensity_max_samples: int = 4096
+    intensity_histogram_bins: int = 32
+    intensity_max_evaluations: int = 180
+    atlas_pixel_size_um: tuple[float, float] | None = None
+    bspline_max_displacement_um: float = 200.0
+    bspline_control_point_spacing_um: float = 1500.0
+    bspline_bending_weight: float = 0.1
+    bspline_max_iterations: int = 40
+    bspline_min_jacobian: float = 0.2
 
 
 @dataclass(frozen=True)
@@ -79,6 +94,7 @@ class SliceRegistrationResult:
     contact_sheet_path: Path | None = None
     mask_diagnostics_path: Path | None = None
     mask_diagnostics_sheet_path: Path | None = None
+    transforms_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +105,7 @@ class _PreparedSectionRegistrationInput:
     section_boundary_mask_crop: np.ndarray
     section_bright_mask_crop: np.ndarray
     section_envelope_mask_crop: np.ndarray
+    crop_origin_yx: tuple[int, int] = (0, 0)
 
 
 def register_slices_to_atlas(
@@ -113,7 +130,9 @@ def register_slices_to_atlas(
     warped_sections_dir = registration_dir / "warped_sections"
     overlay_dir = registration_dir / "overlays"
     affine_overlay_dir = registration_dir / "affine_overlays"
+    transforms_dir = registration_dir / "transforms"
     warped_sections_dir.mkdir(parents=True, exist_ok=True)
+    transforms_dir.mkdir(parents=True, exist_ok=True)
 
     output_rows: list[dict[str, Any]] = []
     section_indices: list[int] = []
@@ -128,11 +147,32 @@ def register_slices_to_atlas(
         atlas_annotation = np.asarray(imread(row["atlas_annotation_path"]))
         atlas_mask = np.asarray(atlas_annotation) > 0
 
+        section_config = cfg
+        if cfg.nonlinear_refinement_model == "bspline" and cfg.atlas_pixel_size_um is None:
+            if not row.get("atlas_pixel_size_y_um") or not row.get("atlas_pixel_size_x_um"):
+                raise ValueError("B-spline registration needs atlas_pixel_size_um, or a pairing manifest with atlas pixel sizes. Recreate atlas inputs or pass --atlas-pixel-size-um Y X.")
+            section_config = replace(cfg, atlas_pixel_size_um=(float(row["atlas_pixel_size_y_um"]), float(row["atlas_pixel_size_x_um"])))
+
         warped_section, registration = _register_section_to_atlas(
             section_image=section_image,
             atlas_reference=atlas_reference,
             atlas_mask=atlas_mask,
-            config=cfg,
+            config=section_config,
+        )
+        transform_path = transforms_dir / f"section{section_index:03d}_transform.npz"
+        displacement = registration.pop("_bspline_displacement", np.empty((2, 0, 0)))
+        bspline_grid = registration.pop("_bspline_grid", {})
+        np.savez_compressed(
+            transform_path,
+            source_to_atlas_matrix=np.asarray(registration.get("source_to_atlas_matrix", registration["matrix"])),
+            source_shape_yx=np.asarray(section_image.shape), output_shape_yx=np.asarray(atlas_mask.shape),
+            crop_origin_yx=np.asarray(registration.get("crop_origin_yx", (0, 0))),
+            crop_shape_yx=np.asarray(registration.get("crop_shape_yx", section_image.shape)),
+            pullback_displacement_yx=displacement,
+            atlas_pixel_size_um=np.asarray(section_config.atlas_pixel_size_um or ()),
+            registration_valid=np.asarray(registration["status"] == "ok"),
+            nonlinear_model=np.asarray(cfg.nonlinear_refinement_model),
+            **bspline_grid,
         )
         registration.pop("_warped_mask", None)
         diagnostic_masks = registration.pop("_diagnostic_masks", None)
@@ -224,6 +264,11 @@ def register_slices_to_atlas(
                 "registration_nonlinear_max_displacement_px": registration["nonlinear_max_displacement_px"],
                 "registration_nonlinear_mean_displacement_px": registration["nonlinear_mean_displacement_px"],
                 "registration_matrix": json.dumps(registration["matrix"]),
+                "registration_source_to_atlas_matrix": json.dumps(registration.get("source_to_atlas_matrix", registration["matrix"])),
+                "registration_crop_origin_yx": json.dumps(registration.get("crop_origin_yx", (0, 0))),
+                "registration_transform_path": str(transform_path),
+                **{f"registration_{key}": json.dumps(value) if isinstance(value, list) else value
+                   for key, value in registration.items() if key.startswith(("intensity_", "bspline_"))},
             }
         )
         section_indices.append(section_index)
@@ -275,6 +320,9 @@ def register_slices_to_atlas(
                     "registration_nonlinear_iterations_completed": int(row["registration_nonlinear_iterations_completed"]),
                     "registration_nonlinear_max_displacement_px": float(row["registration_nonlinear_max_displacement_px"]),
                     "registration_nonlinear_mean_displacement_px": float(row["registration_nonlinear_mean_displacement_px"]),
+                    **{key: value for key, value in row.items()
+                       if key.startswith(("registration_intensity_", "registration_bspline_"))
+                       or key in ("registration_transform_path", "registration_crop_origin_yx", "registration_source_to_atlas_matrix")},
                 }
                 for row in output_rows
             ],
@@ -291,7 +339,45 @@ def register_slices_to_atlas(
         contact_sheet_path=contact_sheet_path,
         mask_diagnostics_path=mask_diagnostics_path,
         mask_diagnostics_sheet_path=mask_diagnostics_sheet_path,
+        transforms_dir=transforms_dir,
     )
+
+
+def apply_slice_registration_transform(
+    image: np.ndarray,
+    transform_path: str | Path,
+    *,
+    fill_value: float = 0.0,
+) -> np.ndarray:
+    """Apply a saved affine/B-spline registration to another source channel.
+
+    The input must have the same section-crop coordinates and shape as the
+    original registration image. Output intensities are sampled once, linearly.
+    """
+    source = np.asarray(image, dtype=np.float32)
+    with np.load(transform_path, allow_pickle=False) as transform:
+        if str(transform["nonlinear_model"]) not in ("none", "bspline"):
+            raise ValueError("Replay supports affine and intensity B-spline transforms; legacy boundary_spline fields are not saved.")
+        if source.ndim != 2 or tuple(source.shape) != tuple(transform["source_shape_yx"]):
+            raise ValueError("The channel must match the original 2D section image shape and coordinates.")
+        output_shape = tuple(int(n) for n in transform["output_shape_yx"])
+        if not bool(transform["registration_valid"]):
+            return np.full(output_shape, fill_value, dtype=np.float32)
+        inverse = _inverse_affine(transform["source_to_atlas_matrix"])
+        displacement = transform["pullback_displacement_yx"]
+        origin = transform["crop_origin_yx"]
+        crop_shape = transform["crop_shape_yx"]
+        crop = source[origin[0]:origin[0] + crop_shape[0], origin[1]:origin[1] + crop_shape[1]]
+        if not displacement.size or not np.any(displacement):
+            translation = np.eye(3)
+            translation[:2, 2] = origin
+            return _warp_image(crop, _compose_affines(transform["source_to_atlas_matrix"], translation), output_shape,
+                               order=1, fill_value=fill_value)
+        yy, xx = _target_grid(*output_shape)
+        yy, xx = yy + displacement[0], xx + displacement[1]
+        source_y = inverse[0, 0] * yy + inverse[0, 1] * xx + inverse[0, 2]
+        source_x = inverse[1, 0] * yy + inverse[1, 1] * xx + inverse[1, 2]
+        return _sample_image(crop, source_y - origin[0], source_x - origin[1], order=1, fill_value=fill_value)
 
 
 def _overlay_thumbnail(overlay: np.ndarray, *, max_size: tuple[int, int] = (320, 240)) -> np.ndarray:
@@ -403,22 +489,28 @@ def _prepare_section_registration_input(
     config: SliceRegistrationConfig,
 ) -> _PreparedSectionRegistrationInput | None:
     bright_mask = _tissue_mask(section_image, quantile=config.tissue_threshold_quantile)
-    section_bbox = _bbox(bright_mask)
+    boundary_mask = _boundary_fit_mask(section_image, config)
+    display_mask = _display_tissue_mask(section_image, config)
+    section_bbox = _bbox(bright_mask | boundary_mask | display_mask)
     if section_bbox is None:
         return None
-
-    section_crop = section_image[section_bbox[0] : section_bbox[1], section_bbox[2] : section_bbox[3]].astype(np.float32)
-    bright_mask_crop = bright_mask[section_bbox[0] : section_bbox[1], section_bbox[2] : section_bbox[3]]
-    boundary_mask_crop = _boundary_fit_mask(section_crop, config)
+    padding = max(0, config.crop_padding_px)
+    y0, y1 = max(0, section_bbox[0] - padding), min(section_image.shape[0], section_bbox[1] + padding)
+    x0, x1 = max(0, section_bbox[2] - padding), min(section_image.shape[1], section_bbox[3] + padding)
+    crop = (slice(y0, y1), slice(x0, x1))
+    section_crop = np.where(np.isfinite(section_image[crop]), section_image[crop], config.fill_value).astype(np.float32)
+    bright_mask_crop = bright_mask[crop]
+    boundary_mask_crop = boundary_mask[crop]
     envelope_mask_crop = boundary_mask_crop if np.any(boundary_mask_crop) else bright_mask_crop
     section_mask_crop = bright_mask_crop if config.tissue_mask_mode == "bright" else envelope_mask_crop
     return _PreparedSectionRegistrationInput(
         section_crop=section_crop,
         section_mask_crop=section_mask_crop,
-        section_display_mask_crop=_display_tissue_mask(section_crop, config),
+        section_display_mask_crop=display_mask[crop],
         section_boundary_mask_crop=boundary_mask_crop,
         section_bright_mask_crop=bright_mask_crop,
         section_envelope_mask_crop=envelope_mask_crop,
+        crop_origin_yx=(y0, x0),
     )
 
 
@@ -428,6 +520,7 @@ def _register_prepared_section_to_atlas(
     atlas_reference: np.ndarray,
     atlas_mask: np.ndarray,
     config: SliceRegistrationConfig,
+    refine_intensity: bool = True,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     atlas_bbox = _bbox(atlas_mask)
     atlas_shape = atlas_reference.shape
@@ -461,6 +554,18 @@ def _register_prepared_section_to_atlas(
         )
     elif config.transform_model != "similarity":
         raise ValueError("transform_model must be one of: 'similarity', 'affine'.")
+
+    transform_matrix, affine_metadata, intensity_metadata = refine_affine_intensity(
+        section_crop, section_mask_crop, section_boundary_mask_crop, atlas_reference, atlas_mask,
+        transform_matrix, initial, best_params, affine_metadata,
+        config if refine_intensity else replace(config, intensity_refinement=False),
+    )
+    if intensity_metadata["intensity_refinement_status"] == "accepted":
+        best_loss = _registration_loss_for_matrix(
+            transform_matrix, section_mask_crop.astype(np.float32), atlas_mask.astype(np.float32), atlas_shape, config,
+            section_boundary_mask=section_boundary_mask_crop.astype(np.float32),
+            transform_regularization=float(affine_metadata["affine_regularization_penalty"]),
+        )
 
     affine_warped_section = _warp_image(section_crop, transform_matrix, atlas_shape, order=1, fill_value=config.fill_value)
     affine_warped_mask = (
@@ -497,6 +602,13 @@ def _register_prepared_section_to_atlas(
     warped_display_mask = affine_warped_display_mask
     warped_boundary_mask = affine_warped_boundary_mask
     nonlinear_metadata = _empty_nonlinear_refinement_metadata(config)
+    bspline_metadata: dict[str, Any] = {
+        "bspline_status": "disabled", "bspline_nmi_before": 0.0, "bspline_nmi_after": 0.0,
+        "bspline_min_jacobian": 1.0, "bspline_max_displacement_um": 0.0,
+        "bspline_optimizer_converged": False, "bspline_iterations": 0,
+    }
+    bspline_displacement = None
+    bspline_grid: dict[str, np.ndarray] = {}
     if config.nonlinear_refinement_model == "boundary_spline":
         (
             warped_section,
@@ -512,12 +624,38 @@ def _register_prepared_section_to_atlas(
             atlas_mask=atlas_mask,
             config=config,
         )
+    elif config.nonlinear_refinement_model == "bspline":
+        bspline_displacement, bspline_metadata, bspline_grid = refine_bspline_intensity(
+            affine_warped_section, affine_warped_mask, atlas_reference, atlas_mask, config,
+        )
+        # Compose the pullback with the affine transform, then sample the original
+        # cropped data once rather than resampling the affine-warped image again.
+        if bspline_metadata["bspline_status"] == "accepted":
+            yy, xx = _target_grid(*atlas_shape)
+            target = np.asarray([yy + bspline_displacement[0], xx + bspline_displacement[1]])
+            inverse = _inverse_affine(transform_matrix)
+            source_y = inverse[0, 0] * target[0] + inverse[0, 1] * target[1] + inverse[0, 2]
+            source_x = inverse[1, 0] * target[0] + inverse[1, 1] * target[1] + inverse[1, 2]
+            warped_section = _sample_image(section_crop, source_y, source_x, order=1, fill_value=config.fill_value)
+            warped_mask = _sample_image(section_mask_crop.astype(np.float32), source_y, source_x, order=0, fill_value=0) >= 0.5
+            warped_display_mask = _sample_image(section_display_mask_crop.astype(np.float32), source_y, source_x, order=0, fill_value=0) >= 0.5
+            warped_boundary_mask = _sample_image(section_boundary_mask_crop.astype(np.float32), source_y, source_x, order=0, fill_value=0) >= 0.5
+        magnitude = np.sqrt(np.sum(bspline_displacement**2, axis=0))
+        active_displacement = magnitude > 1e-6
+        nonlinear_metadata.update(
+            nonlinear_iterations_completed=bspline_metadata["bspline_iterations"] if bspline_metadata["bspline_status"] == "accepted" else 0,
+            nonlinear_max_displacement_px=float(magnitude.max()),
+            nonlinear_mean_displacement_px=float(magnitude[active_displacement].mean()) if np.any(active_displacement) else 0.0,
+        )
     elif config.nonlinear_refinement_model != "none":
-        raise ValueError("nonlinear_refinement_model must be one of: 'none', 'boundary_spline'.")
+        raise ValueError("nonlinear_refinement_model must be one of: 'none', 'boundary_spline', 'bspline'.")
 
     dice, iou = _overlap_metrics(warped_mask, atlas_mask)
     shape_metrics = _shape_metrics(warped_mask, atlas_mask)
     boundary_metrics = _boundary_fit_metrics(warped_boundary_mask, atlas_mask)
+    crop_translation = np.eye(3)
+    crop_translation[:2, 2] = -np.asarray(prepared_section.crop_origin_yx)
+    source_to_atlas_matrix = _compose_affines(transform_matrix, crop_translation)
 
     return warped_section, {
         "status": "ok",
@@ -526,6 +664,11 @@ def _register_prepared_section_to_atlas(
         "iou": float(iou),
         **affine_metadata,
         "matrix": transform_matrix.tolist(),
+        "source_to_atlas_matrix": source_to_atlas_matrix.tolist(),
+        "crop_origin_yx": list(prepared_section.crop_origin_yx),
+        "crop_shape_yx": list(section_crop.shape),
+        "_bspline_displacement": bspline_displacement if bspline_displacement is not None else np.empty((2, 0, 0)),
+        "_bspline_grid": bspline_grid,
         "_warped_mask": warped_mask,
         "_diagnostic_masks": diagnostic_masks,
         "_warped_display_mask": warped_display_mask,
@@ -538,6 +681,8 @@ def _register_prepared_section_to_atlas(
         "affine_boundary_outside_fraction": affine_boundary_metrics["boundary_outside_fraction"],
         "affine_boundary_distance_norm": affine_boundary_distance,
         **nonlinear_metadata,
+        **intensity_metadata,
+        **bspline_metadata,
         **shape_metrics,
         **boundary_metrics,
     }
@@ -1686,6 +1831,18 @@ def _empty_registration() -> dict[str, Any]:
         "nonlinear_iterations_completed": 0,
         "nonlinear_max_displacement_px": 0.0,
         "nonlinear_mean_displacement_px": 0.0,
+        "intensity_refinement_status": "empty_mask",
+        "intensity_nmi_before": 0.0,
+        "intensity_nmi_after": 0.0,
+        "intensity_evaluations": 0,
+        "intensity_levels": [],
+        "bspline_status": "empty_mask",
+        "bspline_nmi_before": 0.0,
+        "bspline_nmi_after": 0.0,
+        "bspline_min_jacobian": 1.0,
+        "bspline_max_displacement_um": 0.0,
+        "bspline_optimizer_converged": False,
+        "bspline_iterations": 0,
     }
 
 

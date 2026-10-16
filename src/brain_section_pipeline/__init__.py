@@ -49,6 +49,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "process_selected_files": ("pipeline", "process_selected_files"),
     "read_nd2_image": ("io", "read_nd2_image"),
     "register_slices_to_atlas": ("slice_registration", "register_slices_to_atlas"),
+    "apply_slice_registration_transform": ("slice_registration", "apply_slice_registration_transform"),
     "run_slicewise_atlas_workflow": ("workflow", "run_slicewise_atlas_workflow"),
     "suggest_atlas_indices": ("atlas_indexing", "suggest_atlas_indices"),
     "robust_scale": ("merge", "robust_scale"),

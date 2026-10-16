@@ -68,6 +68,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-scale-factor", type=float, default=0.6)
     parser.add_argument("--max-scale-factor", type=float, default=1.6)
     parser.add_argument("--translation-search-fraction", type=float, default=0.25)
+    parser.add_argument("--transform-model", choices=("similarity", "affine"), default="affine")
+    parser.add_argument("--crop-padding-px", type=int, default=8)
+    parser.add_argument("--skip-intensity-refinement", action="store_true")
+    parser.add_argument("--intensity-weight", type=float, default=1.0)
+    parser.add_argument("--intensity-pyramid-max-dims", type=int, nargs="+", default=(96, 192, 384))
+    parser.add_argument("--intensity-max-samples", type=int, default=4096)
+    parser.add_argument("--intensity-histogram-bins", type=int, default=32)
+    parser.add_argument("--intensity-max-evaluations", type=int, default=180)
+    parser.add_argument("--nonlinear-refinement-model", choices=("none", "boundary_spline", "bspline"), default="bspline",
+                        help="B-spline refinement is enabled by default; select none to disable it.")
+    parser.add_argument("--atlas-pixel-size-um", type=float, nargs=2, metavar=("Y", "X"), default=None)
+    parser.add_argument("--bspline-max-displacement-um", type=float, default=200.0)
+    parser.add_argument("--bspline-control-point-spacing-um", type=float, default=1500.0)
+    parser.add_argument("--bspline-bending-weight", type=float, default=0.1)
+    parser.add_argument("--bspline-max-iterations", type=int, default=40)
+    parser.add_argument("--bspline-min-jacobian", type=float, default=0.2)
     parser.add_argument("--save-individual-overlays", action="store_true", help="Save every final registration overlay.")
     parser.add_argument("--low-quality-dice-threshold", type=float, default=0.80, help="Save an individual overlay below this Dice score.")
     parser.add_argument("--min-region-pixels", type=int, default=1)
@@ -114,6 +130,21 @@ def main() -> None:
     )
     qc_config = SliceAtlasQcConfig(overlay_alpha=args.overlay_alpha)
     registration_config = SliceRegistrationConfig(
+        transform_model=args.transform_model,
+        crop_padding_px=args.crop_padding_px,
+        intensity_refinement=not args.skip_intensity_refinement,
+        intensity_weight=args.intensity_weight,
+        intensity_pyramid_max_dims=tuple(args.intensity_pyramid_max_dims),
+        intensity_max_samples=args.intensity_max_samples,
+        intensity_histogram_bins=args.intensity_histogram_bins,
+        intensity_max_evaluations=args.intensity_max_evaluations,
+        nonlinear_refinement_model=args.nonlinear_refinement_model,
+        atlas_pixel_size_um=tuple(args.atlas_pixel_size_um) if args.atlas_pixel_size_um else None,
+        bspline_max_displacement_um=args.bspline_max_displacement_um,
+        bspline_control_point_spacing_um=args.bspline_control_point_spacing_um,
+        bspline_bending_weight=args.bspline_bending_weight,
+        bspline_max_iterations=args.bspline_max_iterations,
+        bspline_min_jacobian=args.bspline_min_jacobian,
         tissue_threshold_quantile=args.registration_threshold_quantile,
         overlay_alpha=args.overlay_alpha,
         max_rotation_degrees=args.max_rotation_degrees,

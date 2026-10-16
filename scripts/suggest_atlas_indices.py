@@ -189,6 +189,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     registration_config = SliceRegistrationConfig(
+        nonlinear_refinement_model="none",
         tissue_threshold_quantile=args.tissue_threshold_quantile,
         max_rotation_degrees=args.max_rotation_degrees,
         min_scale_factor=args.min_scale_factor,
